@@ -1,6 +1,8 @@
 use crate::state::AppState;
+use regex::Regex;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 use url::Url;
 
@@ -54,7 +56,11 @@ pub static TRACKING_PARAMS: &[&str] = &[
     "_bta_c",
 ];
 
-/// Strips known tracking tokens from a URL string, returning the cleaned URL if any were removed.
+static URL_FINDER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"https?://[^\s]+").expect("Valid URL finder regex")
+});
+
+/// Strips known tracking tokens from a single URL string.
 pub fn sanitize_url(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
@@ -92,21 +98,46 @@ pub fn sanitize_url(raw: &str) -> Option<String> {
     Some(parsed.to_string())
 }
 
+/// Sanitizes any URLs found in arbitrary copied text (whether solitary or within sentences)
+pub fn sanitize_text_content(text: &str) -> Option<String> {
+    let mut modified = false;
+    let mut result = text.to_string();
+
+    for mat in URL_FINDER.find_iter(text) {
+        let matched_url = mat.as_str();
+        if let Some(cleaned_url) = sanitize_url(matched_url) {
+            result = result.replace(matched_url, &cleaned_url);
+            modified = true;
+        }
+    }
+
+    if modified {
+        Some(result)
+    } else {
+        None
+    }
+}
+
 /// Background loop monitoring system clipboard for tracking URLs
 pub fn start_clipboard_monitor(state: Arc<AppState>) {
     std::thread::spawn(move || {
         let mut last_seen = String::new();
+        let mut clipboard_opt = arboard::Clipboard::new().ok();
 
         loop {
-            std::thread::sleep(Duration::from_millis(600));
+            std::thread::sleep(Duration::from_millis(500));
 
             if !state.clipboard_cleaner.load(Ordering::Relaxed) {
                 continue;
             }
 
-            let mut clipboard = match arboard::Clipboard::new() {
-                Ok(cb) => cb,
-                Err(_) => continue,
+            if clipboard_opt.is_none() {
+                clipboard_opt = arboard::Clipboard::new().ok();
+            }
+
+            let clipboard = match clipboard_opt.as_mut() {
+                Some(cb) => cb,
+                None => continue,
             };
 
             let current_text = match clipboard.get_text() {
@@ -120,12 +151,13 @@ pub fn start_clipboard_monitor(state: Arc<AppState>) {
 
             last_seen = current_text.clone();
 
-            if let Some(cleaned) = sanitize_url(&current_text) {
+            if let Some(cleaned) = sanitize_text_content(&current_text) {
                 if let Ok(()) = clipboard.set_text(cleaned.clone()) {
                     last_seen = cleaned.clone();
 
                     let state_clone = state.clone();
                     tauri::async_runtime::spawn(async move {
+                        state_clone.pii_sanitized.fetch_add(1, Ordering::Relaxed);
                         state_clone
                             .log_event(
                                 "URL_SANITIZED",
@@ -157,5 +189,12 @@ mod tests {
 
         let clean = "https://example.com/search?q=rust+lang";
         assert!(sanitize_url(clean).is_none());
+    }
+
+    #[test]
+    fn test_text_with_embedded_url() {
+        let text = "Check out this deal: https://store.com/item?id=1&gclid=xyz_tracking on sale!";
+        let cleaned = sanitize_text_content(text).unwrap();
+        assert_eq!(cleaned, "Check out this deal: https://store.com/item?id=1 on sale!");
     }
 }

@@ -204,7 +204,7 @@ pub fn run() {
                 doh_pool.clone(),
                 decorrelator.clone(),
             );
-            let proxy_server = ProxyServer::new(app_state.clone());
+            let proxy_server = ProxyServer::new(app_state.clone(), decorrelator.clone());
 
             // Spawn Background DNS Server with auto-port fallback (5300, 1053, etc.)
             tauri::async_runtime::spawn(async move {
@@ -221,6 +221,15 @@ pub fn run() {
                 }
             });
 
+            // Automatically configure OS system proxy on startup if enabled
+            if app_state.proxy_enabled.load(Ordering::Relaxed) {
+                if let Err(e) = enable_system_proxy(1080) {
+                    eprintln!("Warning: could not set OS system proxy on startup: {}", e);
+                } else {
+                    println!("[SYSTEM] Configured OS proxy to 127.0.0.1:1080");
+                }
+            }
+
             // Start background clipboard monitor (uses thread::spawn internally)
             start_clipboard_monitor(app_state.clone());
 
@@ -231,14 +240,36 @@ pub fn run() {
                     .log_event(
                         "SYSTEM_STARTUP",
                         "Ephemeral Privacy Suite Initialized",
-                        "DNS resolver active on :5353, SOCKS5/HTTP proxy on :1080 with SNI slicing.",
+                        "SOCKS5 & HTTP Proxy active on :1080, DNS on :5300. Auto-configured OS routing.",
                         "127.0.0.1",
                     )
                     .await;
             });
 
+            // Register graceful termination cleanup to ensure proxy is reset on exit
+            tauri::async_runtime::spawn(async {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    let _ = disable_system_proxy();
+                }
+            });
+
+            #[cfg(unix)]
+            tauri::async_runtime::spawn(async {
+                use tokio::signal::unix::{signal, SignalKind};
+                if let Ok(mut term) = signal(SignalKind::terminate()) {
+                    term.recv().await;
+                    let _ = disable_system_proxy();
+                }
+            });
+
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                let _ = disable_system_proxy();
+                println!("[SYSTEM] Reset OS proxy to direct connection.");
+            }
+        });
 }
