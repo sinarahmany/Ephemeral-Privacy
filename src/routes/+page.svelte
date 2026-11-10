@@ -20,11 +20,20 @@
     ExternalLink,
     Filter,
     Layers,
-    Send
+    Send,
+    Info,
+    ChevronDown,
+    ChevronUp
   } from "@lucide/svelte";
 
-  // Reactive state using Svelte 5 runes
+  // Navigation tab state
   let activeTab = $state<"dashboard" | "modules" | "ai_sandbox" | "url_cleaner" | "os_telemetry">("dashboard");
+
+  // First-time user guide toggle
+  let showFirstTimeGuide = $state(true);
+
+  // Active info tooltip popup
+  let activeInfoModal = $state<string | null>(null);
 
   let status = $state({
     proxy_enabled: true,
@@ -35,6 +44,7 @@
     pii_redactor: true,
     chaff_intensity: "Smokescreen",
     upstream_resolver: "Rotated (Quad9, Mullvad, Cloudflare)",
+    os_proxy_active: true,
   });
 
   let metrics = $state({
@@ -58,7 +68,7 @@
   let isPanicLoading = $state(false);
   let panicMessage = $state("");
 
-  // Sandbox states
+  // AI Sandbox states
   let sandboxInput = $state(
     "Please review this code for user alex.morgan@fintech.io. Authorization: Bearer sk-ant-api03-9999888877776666555544443333222211110000. Customer card on file is 4532 0151 1283 0366."
   );
@@ -122,8 +132,17 @@
     }
   }
 
+  async function handleReassertProxy() {
+    try {
+      await invoke("reassert_system_proxy");
+      await fetchStatus();
+    } catch (e) {
+      console.error("Failed to re-assert system proxy:", e);
+    }
+  }
+
   async function handlePanic() {
-    if (!confirm("EMERGENCY PANIC: Restore direct network connection, flush system DNS cache, and purge clipboard?")) {
+    if (!confirm("EMERGENCY RESET: Restore direct network connection, flush system DNS cache, and purge clipboard?")) {
       return;
     }
     isPanicLoading = true;
@@ -207,81 +226,160 @@
           <span class="text-slate-600">•</span>
           <span class="font-mono text-slate-300">Proxy :1080</span>
           <span class="text-slate-600">•</span>
-          <span class="font-mono text-slate-300">DNS :5300</span>
+          <span class="font-mono text-cyan-400">Encrypted DoH</span>
+          
+          {#if !status.os_proxy_active}
+            <button
+              onclick={handleReassertProxy}
+              class="ml-2 px-2 py-0.5 rounded bg-amber-950/80 hover:bg-amber-900 border border-amber-600/80 text-[10px] text-amber-300 font-semibold flex items-center gap-1 transition-colors animate-pulse"
+              title="Click to re-route your browser & OS traffic through the privacy proxy"
+            >
+              <AlertTriangle class="w-3 h-3 text-amber-400" />
+              OS Proxy Inactive (Click to Re-enable)
+            </button>
+          {/if}
         </div>
       </div>
     </div>
 
-    <!-- HEADER RIGHT CONTROLS -->
+    <!-- Quick Action Controls -->
     <div class="flex items-center gap-3">
       {#if panicMessage}
-        <div class="text-xs px-3 py-1.5 rounded-lg bg-emerald-950/80 text-emerald-300 border border-emerald-700/60 font-mono animate-fade-in">
+        <span class="text-xs font-mono text-emerald-400 bg-emerald-950/80 border border-emerald-800 px-3 py-1 rounded-lg">
           {panicMessage}
-        </div>
+        </span>
       {/if}
 
       <button
         onclick={triggerManualBurst}
-        class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 transition-colors shadow-sm"
-        title="Fire synthetic decoy queries across multiple DoH resolvers now"
+        class="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-cyan-950/80 hover:bg-cyan-900 border border-cyan-700/80 text-xs font-medium text-cyan-300 transition-all shadow-sm hover:scale-[1.02] active:scale-[0.98]"
+        title="Fire an instant burst of realistic camouflage queries across Quad9, Mullvad, and Cloudflare"
       >
-        <Radio class="w-3.5 h-3.5 text-cyan-400" />
-        Emit Chaff Burst
+        <Radio class="w-3.5 h-3.5 text-cyan-400 animate-pulse" />
+        Send Decoy Burst
       </button>
 
       <button
         onclick={handlePanic}
         disabled={isPanicLoading}
         class="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-red-950/80 hover:bg-red-900 border border-red-700/80 text-xs font-semibold text-red-200 transition-all shadow-lg shadow-red-950/40 hover:scale-[1.02] active:scale-[0.98]"
+        title="Emergency reset: restores direct connection, flushes system DNS, and purges clipboard"
       >
         <Flame class="w-3.5 h-3.5 text-red-400 animate-pulse" />
-        PANIC KILL-SWITCH
+        EMERGENCY RESET
       </button>
     </div>
   </header>
 
-  <!-- METRICS STRIP -->
+  <!-- METRICS STRIP WITH FRIENDLY EXPLANATIONS -->
   <div class="grid grid-cols-4 gap-4 px-6 py-4 bg-slate-900/40 border-b border-slate-800/60 shrink-0">
-    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-3.5 flex items-center justify-between shadow-sm">
+    <!-- Metric 1: Web Requests Shielded -->
+    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-3.5 flex items-center justify-between shadow-sm relative group">
       <div>
-        <div class="text-[11px] font-medium uppercase tracking-wider text-slate-400">Queries Protected</div>
-        <div class="text-2xl font-bold font-mono text-slate-100 mt-1">{metrics.queries_intercepted}</div>
+        <div class="flex items-center gap-1.5">
+          <div class="text-[11px] font-medium uppercase tracking-wider text-slate-400">Web Requests Shielded</div>
+          <button 
+            type="button"
+            onclick={() => activeInfoModal = activeInfoModal === 'queries' ? null : 'queries'} 
+            class="text-slate-500 hover:text-cyan-400 transition-colors"
+            title="What is this?"
+          >
+            <Info class="w-3 h-3" />
+          </button>
+        </div>
+        <div class="text-2xl font-bold font-mono text-slate-100 mt-0.5">{metrics.queries_intercepted}</div>
+        <div class="text-[10px] text-slate-500 mt-0.5">Sites routed through local shield</div>
       </div>
       <div class="w-9 h-9 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400">
         <Activity class="w-5 h-5" />
       </div>
     </div>
 
-    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-3.5 flex items-center justify-between shadow-sm">
+    <!-- Metric 2: Camouflage Decoys Sent -->
+    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-3.5 flex items-center justify-between shadow-sm relative group">
       <div>
-        <div class="text-[11px] font-medium uppercase tracking-wider text-slate-400">Chaff Decoys Emitted</div>
-        <div class="text-2xl font-bold font-mono text-cyan-400 mt-1">{metrics.chaff_queries_sent}</div>
+        <div class="flex items-center gap-1.5">
+          <div class="text-[11px] font-medium uppercase tracking-wider text-slate-400">Camouflage Searches Sent</div>
+          <button 
+            type="button"
+            onclick={() => activeInfoModal = activeInfoModal === 'chaff' ? null : 'chaff'} 
+            class="text-slate-500 hover:text-cyan-400 transition-colors"
+            title="What is this?"
+          >
+            <Info class="w-3 h-3" />
+          </button>
+        </div>
+        <div class="text-2xl font-bold font-mono text-cyan-400 mt-0.5">{metrics.chaff_queries_sent}</div>
+        <div class="text-[10px] text-slate-500 mt-0.5">Decoys sent to poison ad profiles</div>
       </div>
       <div class="w-9 h-9 rounded-lg bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center text-cyan-400">
         <Radio class="w-5 h-5 animate-pulse" />
       </div>
     </div>
 
-    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-3.5 flex items-center justify-between shadow-sm">
+    <!-- Metric 3: Trackers & Ads Blocked -->
+    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-3.5 flex items-center justify-between shadow-sm relative group">
       <div>
-        <div class="text-[11px] font-medium uppercase tracking-wider text-slate-400">Trackers Sinkholed</div>
-        <div class="text-2xl font-bold font-mono text-amber-400 mt-1">{metrics.trackers_blocked}</div>
+        <div class="flex items-center gap-1.5">
+          <div class="text-[11px] font-medium uppercase tracking-wider text-slate-400">Trackers & Ads Blocked</div>
+          <button 
+            type="button"
+            onclick={() => activeInfoModal = activeInfoModal === 'trackers' ? null : 'trackers'} 
+            class="text-slate-500 hover:text-amber-400 transition-colors"
+            title="What is this?"
+          >
+            <Info class="w-3 h-3" />
+          </button>
+        </div>
+        <div class="text-2xl font-bold font-mono text-amber-400 mt-0.5">{metrics.trackers_blocked}</div>
+        <div class="text-[10px] text-slate-500 mt-0.5">Ad networks & spyware dropped</div>
       </div>
       <div class="w-9 h-9 rounded-lg bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400">
         <EyeOff class="w-5 h-5" />
       </div>
     </div>
 
-    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-3.5 flex items-center justify-between shadow-sm">
+    <!-- Metric 4: Anti-ISP Handshake Slices -->
+    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-3.5 flex items-center justify-between shadow-sm relative group">
       <div>
-        <div class="text-[11px] font-medium uppercase tracking-wider text-slate-400">SNI DPI Slices</div>
-        <div class="text-2xl font-bold font-mono text-emerald-400 mt-1">{metrics.sni_sliced_handshakes}</div>
+        <div class="flex items-center gap-1.5">
+          <div class="text-[11px] font-medium uppercase tracking-wider text-slate-400">ISP Snooping Blocks</div>
+          <button 
+            type="button"
+            onclick={() => activeInfoModal = activeInfoModal === 'sni' ? null : 'sni'} 
+            class="text-slate-500 hover:text-emerald-400 transition-colors"
+            title="What is this?"
+          >
+            <Info class="w-3 h-3" />
+          </button>
+        </div>
+        <div class="text-2xl font-bold font-mono text-emerald-400 mt-0.5">{metrics.sni_sliced_handshakes}</div>
+        <div class="text-[10px] text-slate-500 mt-0.5">Packets sliced to hide site names</div>
       </div>
       <div class="w-9 h-9 rounded-lg bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
         <Lock class="w-5 h-5" />
       </div>
     </div>
   </div>
+
+  <!-- EXPANDABLE EXPLANATION BANNER (If user clicked an info icon) -->
+  {#if activeInfoModal}
+    <div class="px-6 py-3 bg-slate-900/90 border-b border-cyan-800/40 text-xs flex items-center justify-between text-slate-200">
+      <div class="flex items-center gap-2">
+        <Info class="w-4 h-4 text-cyan-400 shrink-0" />
+        {#if activeInfoModal === 'queries'}
+          <span><strong>Web Requests Shielded:</strong> Count of actual website connections (via HTTP/HTTPS and SOCKS5) handled by your private local proxy daemon, protecting your true origin and resolving DNS via encrypted DoH.</span>
+        {:else if activeInfoModal === 'chaff'}
+          <span><strong>Camouflage Searches Sent:</strong> Synthetic, realistic search and DNS decoys fired across multiple resolvers (Quad9, Mullvad, Cloudflare) with randomized delays to make ad tracking mathematically impossible.</span>
+        {:else if activeInfoModal === 'trackers'}
+          <span><strong>Trackers & Ads Blocked:</strong> Known tracking brokers, telemetry endpoints, and sneaky disguised CNAME trackers that were dropped before they could collect data from your computer.</span>
+        {:else if activeInfoModal === 'sni'}
+          <span><strong>ISP Snooping Blocks:</strong> Slices the unencrypted Server Name Indication (SNI) in your HTTPS connection packets across TCP boundaries so your Internet Service Provider's deep packet inspection (DPI) boxes cannot read what website you are visiting.</span>
+        {/if}
+      </div>
+      <button onclick={() => activeInfoModal = null} class="text-xs text-slate-400 hover:text-white px-2 py-0.5">Dismiss</button>
+    </div>
+  {/if}
 
   <!-- NAVIGATION TABS -->
   <div class="px-6 border-b border-slate-800/80 bg-slate-950/40 flex gap-2 shrink-0">
@@ -290,155 +388,230 @@
       class="px-4 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-2 {activeTab === 'dashboard' ? 'border-cyan-400 text-cyan-300' : 'border-transparent text-slate-400 hover:text-slate-200'}"
     >
       <Activity class="w-4 h-4" />
-      Chaff Radar & Live Stream
+      Dashboard & Live Activity
     </button>
     <button
       onclick={() => (activeTab = "modules")}
       class="px-4 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-2 {activeTab === 'modules' ? 'border-cyan-400 text-cyan-300' : 'border-transparent text-slate-400 hover:text-slate-200'}"
     >
       <Sliders class="w-4 h-4" />
-      Privacy Shields & Controls
+      Shields & Anti-ISP Controls
     </button>
     <button
       onclick={() => (activeTab = "ai_sandbox")}
       class="px-4 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-2 {activeTab === 'ai_sandbox' ? 'border-cyan-400 text-cyan-300' : 'border-transparent text-slate-400 hover:text-slate-200'}"
     >
       <Lock class="w-4 h-4" />
-      AI & Chat PII Sanitizer
+      AI & Chat Privacy Shield
     </button>
     <button
       onclick={() => (activeTab = "url_cleaner")}
       class="px-4 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-2 {activeTab === 'url_cleaner' ? 'border-cyan-400 text-cyan-300' : 'border-transparent text-slate-400 hover:text-slate-200'}"
     >
       <Filter class="w-4 h-4" />
-      Link De-tracker
+      Tracking Link Stripper
     </button>
     <button
       onclick={() => (activeTab = "os_telemetry")}
       class="px-4 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-2 {activeTab === 'os_telemetry' ? 'border-cyan-400 text-cyan-300' : 'border-transparent text-slate-400 hover:text-slate-200'}"
     >
       <Layers class="w-4 h-4" />
-      OS Telemetry Profiles
+      System Telemetry Audit
     </button>
   </div>
 
   <!-- MAIN TAB CONTENT -->
   <main class="flex-1 overflow-y-auto p-6">
     {#if activeTab === "dashboard"}
-      <div class="grid grid-cols-12 gap-6 h-full">
-        <!-- LEFT: CHAFF RADAR & CONFIG -->
-        <div class="col-span-5 flex flex-col gap-6">
-          <!-- Chaff Visualizer Card -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 shadow-lg relative overflow-hidden flex flex-col justify-between">
-            <div class="flex items-center justify-between mb-4">
+      <div class="space-y-6">
+        <!-- FIRST-TIME USER EXPLAINER BANNER -->
+        {#if showFirstTimeGuide}
+          <div class="bg-gradient-to-r from-slate-900 via-indigo-950/40 to-slate-900 border border-indigo-800/40 rounded-2xl p-4 shadow-lg relative">
+            <div class="flex items-center justify-between mb-3">
+              <div class="flex items-center gap-2">
+                <span class="text-base">💡</span>
+                <h3 class="text-xs font-semibold text-indigo-200 uppercase tracking-wider">
+                  New to Ephemeral Privacy? Here is how your computer is protected:
+                </h3>
+              </div>
+              <button 
+                onclick={() => showFirstTimeGuide = false}
+                class="text-[11px] text-slate-400 hover:text-slate-200 transition-colors"
+              >
+                Hide Guide
+              </button>
+            </div>
+
+            <div class="grid grid-cols-4 gap-3 text-xs">
+              <div class="bg-slate-950/60 p-3 rounded-xl border border-slate-800/80">
+                <div class="font-semibold text-cyan-300 flex items-center gap-1.5 mb-1">
+                  <span>1.</span> Decoy Camouflage
+                </div>
+                <p class="text-slate-400 text-[11px] leading-relaxed">
+                  Every time you browse, fake realistic searches are mixed in across Quad9, Mullvad, and Cloudflare so ad networks cannot build a profile on you.
+                </p>
+              </div>
+
+              <div class="bg-slate-950/60 p-3 rounded-xl border border-slate-800/80">
+                <div class="font-semibold text-emerald-300 flex items-center gap-1.5 mb-1">
+                  <span>2.</span> Anti-ISP Packet Slicing
+                </div>
+                <p class="text-slate-400 text-[11px] leading-relaxed">
+                  Your internet provider watches which websites you visit. This breaks your HTTPS packets into tiny slices so ISP inspection equipment cannot read the domain name.
+                </p>
+              </div>
+
+              <div class="bg-slate-950/60 p-3 rounded-xl border border-slate-800/80">
+                <div class="font-semibold text-amber-300 flex items-center gap-1.5 mb-1">
+                  <span>3.</span> Tracker Sinkhole
+                </div>
+                <p class="text-slate-400 text-[11px] leading-relaxed">
+                  Known telemetry endpoints, ad servers, and sneaky first-party CNAME disguised trackers are blocked before they can load.
+                </p>
+              </div>
+
+              <div class="bg-slate-950/60 p-3 rounded-xl border border-slate-800/80">
+                <div class="font-semibold text-indigo-300 flex items-center gap-1.5 mb-1">
+                  <span>4.</span> Clipboard & AI Guard
+                </div>
+                <p class="text-slate-400 text-[11px] leading-relaxed">
+                  Tracking tokens (like <code class="text-slate-300">fbclid</code> or <code class="text-slate-300">utm_*</code>) are stripped from copied links, and sensitive data is censored before pasting into AI models.
+                </p>
+              </div>
+            </div>
+          </div>
+        {/if}
+
+        <div class="grid grid-cols-12 gap-6">
+          <!-- LEFT: CAMOUFLAGE & ANTI-DPI CONTROLS -->
+          <div class="col-span-5 flex flex-col gap-6">
+            <!-- Camouflage Engine Card -->
+            <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 shadow-lg relative overflow-hidden flex flex-col justify-between">
+              <div class="flex items-center justify-between mb-4">
+                <div>
+                  <h3 class="text-sm font-semibold text-slate-200 flex items-center gap-2">
+                    <Radio class="w-4 h-4 text-cyan-400 animate-pulse" />
+                    Search & Browsing Camouflage
+                  </h3>
+                  <p class="text-xs text-slate-400 mt-0.5">Emits decoy queries to poison tracking algorithms</p>
+                </div>
+                <span class="text-[10px] font-mono px-2 py-0.5 rounded-full bg-cyan-950 text-cyan-300 border border-cyan-800/60">
+                  ACTIVE
+                </span>
+              </div>
+
+              <!-- Radar Animated Wave Canvas Simulation -->
+              <div class="h-36 rounded-xl bg-slate-950/80 border border-slate-800/80 relative flex items-center justify-center overflow-hidden">
+                <div class="absolute inset-0 bg-[radial-gradient(#06b6d4_1px,transparent_1px)] [background-size:16px_16px] opacity-20"></div>
+                
+                <!-- Expanding concentric rings -->
+                <div class="absolute w-24 h-24 rounded-full border border-cyan-500/30 animate-ping"></div>
+                <div class="absolute w-16 h-16 rounded-full border border-cyan-400/50"></div>
+                <div class="absolute w-6 h-6 rounded-full bg-cyan-400/80 shadow-lg shadow-cyan-400/50 flex items-center justify-center">
+                  <span class="w-2 h-2 rounded-full bg-white"></span>
+                </div>
+
+                <!-- Rotating scan line -->
+                <div class="absolute w-28 h-28 border-r border-cyan-400/40 rounded-full animate-spin [animation-duration:3s]"></div>
+
+                <div class="absolute bottom-2 left-3 text-[10px] font-mono text-cyan-400/80">
+                  UPSTREAMS: QUAD9 ↔ MULLVAD ↔ CLOUDFLARE
+                </div>
+              </div>
+
+              <!-- Camouflage Density Selector -->
+              <div class="mt-4">
+                <div class="flex items-center justify-between mb-2">
+                  <span class="text-xs font-medium text-slate-300">Camouflage Density (Decoy Volume)</span>
+                  <span class="text-[10px] text-slate-500">Poisson Distribution</span>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                  {#each [
+                    { id: "Ghost", label: "Ghost", desc: "Light Decoys" },
+                    { id: "Smokescreen", label: "Smokescreen", desc: "Balanced (Rec.)" },
+                    { id: "HeavyFog", label: "Heavy Fog", desc: "Maximum" }
+                  ] as mode}
+                    <button
+                      onclick={() => handleIntensityChange(mode.id)}
+                      class="px-2.5 py-2 rounded-xl text-xs font-medium border transition-all text-center flex flex-col items-center gap-0.5 {status.chaff_intensity === mode.id ? 'bg-cyan-500/20 border-cyan-500 text-cyan-200 shadow-md shadow-cyan-500/10' : 'bg-slate-800/40 border-slate-700/60 text-slate-400 hover:text-slate-200'}"
+                    >
+                      <span class="font-semibold">{mode.label}</span>
+                      <span class="text-[10px] opacity-75">{mode.desc}</span>
+                    </button>
+                  {/each}
+                </div>
+              </div>
+            </div>
+
+            <!-- Anti-DPI & SNI Slicing Status Card -->
+            <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 shadow-lg">
+              <div class="flex items-center justify-between mb-2">
+                <h3 class="text-sm font-semibold text-slate-200 flex items-center gap-2">
+                  <Lock class="w-4 h-4 text-emerald-400" />
+                  Anti-ISP Snooping (Packet Slicing)
+                </h3>
+                <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/60 font-semibold">
+                  {status.sni_fragmentation ? "PROTECTING" : "OFF"}
+                </span>
+              </div>
+              <p class="text-xs text-slate-400 leading-relaxed">
+                When you connect to an HTTPS website, your browser sends the website name in cleartext (SNI). This splits that first packet into microscopic fragments across TCP packets so ISP Deep Packet Inspection (DPI) scanners cannot read what domain you are visiting.
+              </p>
+              <div class="mt-3 flex items-center justify-between text-xs bg-slate-950/60 p-2.5 rounded-xl border border-slate-800/80">
+                <span class="text-slate-300">TLS 1.3 ClientHello Fragmentation</span>
+                <span class="font-mono text-emerald-400 font-semibold">ACTIVE</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- RIGHT: LIVE MEMORY-ONLY PRIVACY STREAM -->
+          <div class="col-span-7 bg-slate-900/60 border border-slate-800 rounded-2xl p-5 shadow-lg flex flex-col">
+            <div class="flex items-center justify-between mb-3 shrink-0">
               <div>
                 <h3 class="text-sm font-semibold text-slate-200 flex items-center gap-2">
-                  <Radio class="w-4 h-4 text-cyan-400 animate-pulse" />
-                  Query De-correlation Engine
+                  <Terminal class="w-4 h-4 text-cyan-400" />
+                  Live Privacy Event Stream
                 </h3>
-                <p class="text-xs text-slate-400 mt-0.5">Poisson Burst Generator & Multi-DoH Dispersion</p>
+                <p class="text-[11px] text-slate-400">Strictly in RAM. Zero logs written to disk.</p>
               </div>
-              <span class="text-[10px] font-mono px-2 py-0.5 rounded-full bg-cyan-950 text-cyan-300 border border-cyan-800/60">
-                ACTIVE
-              </span>
+              <span class="text-[10px] font-mono text-slate-500">RAM RING BUFFER (50)</span>
             </div>
 
-            <!-- Radar Animated Wave Canvas Simulation -->
-            <div class="h-36 rounded-xl bg-slate-950/80 border border-slate-800/80 relative flex items-center justify-center overflow-hidden">
-              <div class="absolute inset-0 bg-[radial-gradient(#06b6d4_1px,transparent_1px)] [background-size:16px_16px] opacity-20"></div>
-              
-              <!-- Expanding concentric rings -->
-              <div class="absolute w-24 h-24 rounded-full border border-cyan-500/30 animate-ping"></div>
-              <div class="absolute w-16 h-16 rounded-full border border-cyan-400/50"></div>
-              <div class="absolute w-6 h-6 rounded-full bg-cyan-400/80 shadow-lg shadow-cyan-400/50 flex items-center justify-center">
-                <span class="w-2 h-2 rounded-full bg-white"></span>
-              </div>
-
-              <!-- Rotating scan line -->
-              <div class="absolute w-28 h-28 border-r border-cyan-400/40 rounded-full animate-spin [animation-duration:3s]"></div>
-
-              <div class="absolute bottom-2 left-3 text-[10px] font-mono text-cyan-400/80">
-                DISPERSION: QUAD9 ↔ MULLVAD ↔ CLOUDFLARE
-              </div>
-            </div>
-
-            <!-- Chaff Intensity Selector -->
-            <div class="mt-4">
-              <label class="text-xs font-medium text-slate-300 block mb-2">Chaff Smokescreen Density</label>
-              <div class="grid grid-cols-3 gap-2">
-                {#each ["Ghost", "Smokescreen", "HeavyFog"] as mode}
-                  <button
-                    onclick={() => handleIntensityChange(mode)}
-                    class="px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-all text-center {status.chaff_intensity === mode ? 'bg-cyan-500/20 border-cyan-500 text-cyan-200' : 'bg-slate-800/40 border-slate-700/60 text-slate-400 hover:text-slate-200'}"
-                  >
-                    {mode}
-                  </button>
-                {/each}
-              </div>
-            </div>
-          </div>
-
-          <!-- Anti-DPI & SNI Slicing Status Card -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 shadow-lg">
-            <h3 class="text-sm font-semibold text-slate-200 flex items-center gap-2 mb-2">
-              <Lock class="w-4 h-4 text-emerald-400" />
-              Anti-ISP Deep Packet Inspection (DPI)
-            </h3>
-            <p class="text-xs text-slate-400 leading-relaxed">
-              Splits the unencrypted TLS 1.3 <span class="font-mono text-cyan-300">ClientHello</span> packet right through the middle of the SNI domain name. ISP line-rate DPI middleboxes cannot extract the hostname, keeping your visited domains invisible.
-            </p>
-            <div class="mt-3 flex items-center justify-between text-xs bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/80">
-              <span class="text-slate-300">SNI TCP Slicing</span>
-              <span class="font-mono text-emerald-400 font-semibold">{status.sni_fragmentation ? "ENABLED" : "DISABLED"}</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- RIGHT: LIVE MEMORY-ONLY PRIVACY STREAM -->
-        <div class="col-span-7 bg-slate-900/60 border border-slate-800 rounded-2xl p-5 shadow-lg flex flex-col">
-          <div class="flex items-center justify-between mb-3 shrink-0">
-            <div>
-              <h3 class="text-sm font-semibold text-slate-200 flex items-center gap-2">
-                <Terminal class="w-4 h-4 text-cyan-400" />
-                Live Privacy Event Stream
-              </h3>
-              <p class="text-[11px] text-slate-400">Zero disk persistence. All entries exist purely in volatile RAM.</p>
-            </div>
-            <span class="text-[10px] font-mono text-slate-500">MAX 50 EVENTS</span>
-          </div>
-
-          <!-- Log stream list -->
-          <div class="flex-1 overflow-y-auto space-y-2 pr-1 min-h-[300px] max-h-[460px]">
-            {#if recentEvents.length === 0}
-              <div class="h-48 flex flex-col items-center justify-center text-slate-500 text-xs">
-                <Shield class="w-8 h-8 mb-2 opacity-30" />
-                No events recorded yet. Browse or emit a chaff burst to see live activity.
-              </div>
-            {:else}
-              {#each recentEvents as ev (ev.id)}
-                <div class="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3 text-xs flex flex-col gap-1 transition-all hover:border-slate-700">
-                  <div class="flex items-center justify-between">
-                    <span class="font-medium text-slate-200 flex items-center gap-2">
-                      {#if ev.category === "DNS_CHAFF" || ev.category === "SEARCH_CHAFF"}
-                        <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-cyan-950 text-cyan-400 border border-cyan-800/50">CHAFF</span>
-                      {:else if ev.category === "TRACKER_BLOCKED"}
-                        <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-amber-950 text-amber-400 border border-amber-800/50">SINKHOLE</span>
-                      {:else if ev.category === "SNI_FRAGMENTED"}
-                        <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-emerald-950 text-emerald-400 border border-emerald-800/50">ANTI-DPI</span>
-                      {:else if ev.category === "URL_SANITIZED"}
-                        <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-indigo-950 text-indigo-400 border border-indigo-800/50">CLEANED</span>
-                      {:else}
-                        <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-slate-800 text-slate-300">SYSTEM</span>
-                      {/if}
-                      {ev.title}
-                    </span>
-                    <span class="text-[10px] font-mono text-slate-500">{new Date(ev.timestamp * 1000).toLocaleTimeString()}</span>
-                  </div>
-                  <div class="text-slate-400 text-[11px] leading-relaxed">{ev.details}</div>
-                  <div class="text-[10px] font-mono text-cyan-500/80 truncate">Target: {ev.target}</div>
+            <!-- Log stream list -->
+            <div class="flex-1 overflow-y-auto space-y-2 pr-1 min-h-[360px] max-h-[480px]">
+              {#if recentEvents.length === 0}
+                <div class="h-64 flex flex-col items-center justify-center text-slate-500 text-xs">
+                  <Shield class="w-8 h-8 mb-2 opacity-30" />
+                  No events recorded yet. Open any website in your browser to see live activity.
                 </div>
-              {/each}
-            {/if}
+              {:else}
+                {#each recentEvents as ev (ev.id)}
+                  <div class="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3 text-xs flex flex-col gap-1 transition-all hover:border-slate-700">
+                    <div class="flex items-center justify-between">
+                      <span class="font-medium text-slate-200 flex items-center gap-2">
+                        {#if ev.category === "DNS_CHAFF" || ev.category === "SEARCH_CHAFF"}
+                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-cyan-950 text-cyan-400 border border-cyan-800/50">CAMOUFLAGE</span>
+                        {:else if ev.category === "TRACKER_BLOCKED"}
+                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-amber-950 text-amber-400 border border-amber-800/50">BLOCKED</span>
+                        {:else if ev.category === "SNI_FRAGMENTED"}
+                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-emerald-950 text-emerald-400 border border-emerald-800/50">ISP SLICE</span>
+                        {:else if ev.category === "DOH_RESOLVED"}
+                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-blue-950 text-blue-400 border border-blue-800/50">ENCRYPTED DOH</span>
+                        {:else if ev.category === "URL_SANITIZED"}
+                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-indigo-950 text-indigo-400 border border-indigo-800/50">CLEANED LINK</span>
+                        {:else}
+                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-slate-800 text-slate-300">SYSTEM</span>
+                        {/if}
+                        {ev.title}
+                      </span>
+                      <span class="text-[10px] font-mono text-slate-500">{new Date(ev.timestamp * 1000).toLocaleTimeString()}</span>
+                    </div>
+                    <div class="text-slate-400 text-[11px] leading-relaxed">{ev.details}</div>
+                    <div class="text-[10px] font-mono text-cyan-500/80 truncate">Target: {ev.target}</div>
+                  </div>
+                {/each}
+              {/if}
+            </div>
           </div>
         </div>
       </div>
@@ -446,129 +619,159 @@
       <!-- PRIVACY SHIELDS & CONTROLS -->
       <div class="max-w-4xl mx-auto space-y-4">
         <div>
-          <h2 class="text-base font-bold text-slate-100">Privacy Module Controls</h2>
-          <p class="text-xs text-slate-400">Configure background shields, upstream resolvers, and interception rules.</p>
+          <h2 class="text-base font-bold text-slate-100">Privacy Shields & Anti-ISP Controls</h2>
+          <p class="text-xs text-slate-400">Toggle individual privacy layers. Every module runs entirely locally in user space without requiring root or kernel extensions.</p>
         </div>
 
         <div class="grid grid-cols-2 gap-4">
-          <!-- Module 1: Query De-correlator -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex items-start justify-between">
-            <div class="space-y-1 pr-4">
-              <div class="flex items-center gap-2">
-                <Radio class="w-4 h-4 text-cyan-400" />
-                <span class="text-sm font-semibold text-slate-200">Ephemeral Query De-correlator</span>
+          <!-- Module 1: Search & Browsing Camouflage -->
+          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
+            <div>
+              <div class="flex items-center justify-between mb-2">
+                <div class="flex items-center gap-2">
+                  <Radio class="w-4 h-4 text-cyan-400" />
+                  <span class="text-sm font-semibold text-slate-200">Search & Browsing Camouflage</span>
+                </div>
+                <button
+                  aria-label="Toggle Camouflage Decoy Engine"
+                  onclick={() => handleToggle("chaff", status.chaff_enabled)}
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.chaff_enabled ? 'bg-cyan-500' : 'bg-slate-700'}"
+                >
+                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.chaff_enabled ? 'translate-x-5' : ''}"></span>
+                </button>
               </div>
-              <p class="text-xs text-slate-400 leading-relaxed">
-                Intersperses realistic decoy DNS & search queries with Poisson-jittered delays across multiple upstreams to break ISP/profiler correlation.
+              <p class="text-xs text-slate-400 leading-relaxed mb-3">
+                Intersperses realistic decoy DNS & search queries with randomized Poisson delays across Quad9, Mullvad, and Cloudflare to make automated profiling useless.
               </p>
             </div>
-            <button
-              aria-label="Toggle Ephemeral Query De-correlator"
-              onclick={() => handleToggle("chaff", status.chaff_enabled)}
-              class="w-12 h-6 rounded-full transition-colors relative shrink-0 {status.chaff_enabled ? 'bg-cyan-500' : 'bg-slate-700'}"
-            >
-              <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.chaff_enabled ? 'translate-x-6' : ''}"></span>
-            </button>
+            <div class="text-[10px] text-cyan-400/90 bg-cyan-950/40 p-2 rounded-lg border border-cyan-800/30">
+              🛡️ <strong>Threat stopped:</strong> ISP and advertiser timeline profiling.
+            </div>
           </div>
 
-          <!-- Module 2: Anti-DPI SNI Fragmentation -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex items-start justify-between">
-            <div class="space-y-1 pr-4">
-              <div class="flex items-center gap-2">
-                <Lock class="w-4 h-4 text-emerald-400" />
-                <span class="text-sm font-semibold text-slate-200">Anti-DPI SNI Fragmentation</span>
+          <!-- Module 2: Anti-ISP SNI Packet Slicing -->
+          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
+            <div>
+              <div class="flex items-center justify-between mb-2">
+                <div class="flex items-center gap-2">
+                  <Lock class="w-4 h-4 text-emerald-400" />
+                  <span class="text-sm font-semibold text-slate-200">Anti-ISP Packet Slicing</span>
+                </div>
+                <button
+                  aria-label="Toggle Anti-ISP SNI Slicing"
+                  onclick={() => handleToggle("sni", status.sni_fragmentation)}
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.sni_fragmentation ? 'bg-emerald-500' : 'bg-slate-700'}"
+                >
+                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.sni_fragmentation ? 'translate-x-5' : ''}"></span>
+                </button>
               </div>
-              <p class="text-xs text-slate-400 leading-relaxed">
-                Slices TLS ClientHello packets across TCP boundaries so ISP Deep Packet Inspection boxes cannot see which HTTPS websites you connect to.
+              <p class="text-xs text-slate-400 leading-relaxed mb-3">
+                Splits the unencrypted TLS 1.3 ClientHello packet right through the middle of the domain name so ISP Deep Packet Inspection boxes cannot see which websites you visit.
               </p>
             </div>
-            <button
-              aria-label="Toggle Anti-DPI SNI Fragmentation"
-              onclick={() => handleToggle("sni", status.sni_fragmentation)}
-              class="w-12 h-6 rounded-full transition-colors relative shrink-0 {status.sni_fragmentation ? 'bg-emerald-500' : 'bg-slate-700'}"
-            >
-              <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.sni_fragmentation ? 'translate-x-6' : ''}"></span>
-            </button>
+            <div class="text-[10px] text-emerald-400/90 bg-emerald-950/40 p-2 rounded-lg border border-emerald-800/30">
+              🛡️ <strong>Threat stopped:</strong> ISP browsing history logging & surveillance.
+            </div>
           </div>
 
           <!-- Module 3: Local DNS Sinkhole & CNAME Uncloaking -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex items-start justify-between">
-            <div class="space-y-1 pr-4">
-              <div class="flex items-center gap-2">
-                <EyeOff class="w-4 h-4 text-amber-400" />
-                <span class="text-sm font-semibold text-slate-200">DNS Sinkhole & CNAME Uncloaker</span>
+          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
+            <div>
+              <div class="flex items-center justify-between mb-2">
+                <div class="flex items-center gap-2">
+                  <EyeOff class="w-4 h-4 text-amber-400" />
+                  <span class="text-sm font-semibold text-slate-200">Ad Sinkhole & Stealth Tracker Blocker</span>
+                </div>
+                <button
+                  aria-label="Toggle DNS Sinkhole"
+                  onclick={() => handleToggle("dns", status.dns_enabled)}
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.dns_enabled ? 'bg-amber-500' : 'bg-slate-700'}"
+                >
+                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.dns_enabled ? 'translate-x-5' : ''}"></span>
+                </button>
               </div>
-              <p class="text-xs text-slate-400 leading-relaxed">
-                Sinkholes ad/tracking servers system-wide on 127.0.0.1:5300. Unmasks first-party CNAME cloaking used to evade traditional ad-blockers.
+              <p class="text-xs text-slate-400 leading-relaxed mb-3">
+                Instantly drops connections to known tracking servers. Unmasks sneaky first-party CNAME aliases that websites use to bypass normal browser ad-blockers.
               </p>
             </div>
-            <button
-              aria-label="Toggle DNS Sinkhole"
-              onclick={() => handleToggle("dns", status.dns_enabled)}
-              class="w-12 h-6 rounded-full transition-colors relative shrink-0 {status.dns_enabled ? 'bg-amber-500' : 'bg-slate-700'}"
-            >
-              <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.dns_enabled ? 'translate-x-6' : ''}"></span>
-            </button>
+            <div class="text-[10px] text-amber-400/90 bg-amber-950/40 p-2 rounded-lg border border-amber-800/30">
+              🛡️ <strong>Threat stopped:</strong> Cross-site telemetry & disguised analytics.
+            </div>
           </div>
 
-          <!-- Module 4: Clipboard Sanitizer -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex items-start justify-between">
-            <div class="space-y-1 pr-4">
-              <div class="flex items-center gap-2">
-                <Filter class="w-4 h-4 text-indigo-400" />
-                <span class="text-sm font-semibold text-slate-200">Universal Clipboard Link Cleaner</span>
+          <!-- Module 4: Clipboard Link Cleaner -->
+          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
+            <div>
+              <div class="flex items-center justify-between mb-2">
+                <div class="flex items-center gap-2">
+                  <Filter class="w-4 h-4 text-indigo-400" />
+                  <span class="text-sm font-semibold text-slate-200">Clipboard Tracking Link Stripper</span>
+                </div>
+                <button
+                  aria-label="Toggle Clipboard Sanitizer"
+                  onclick={() => handleToggle("clipboard", status.clipboard_cleaner)}
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.clipboard_cleaner ? 'bg-indigo-500' : 'bg-slate-700'}"
+                >
+                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.clipboard_cleaner ? 'translate-x-5' : ''}"></span>
+                </button>
               </div>
-              <p class="text-xs text-slate-400 leading-relaxed">
-                Monitors system clipboard and strips 250+ tracking tokens (fbclid, gclid, utm_*) in &lt;1ms without breaking destinations.
+              <p class="text-xs text-slate-400 leading-relaxed mb-3">
+                Silently listens to your clipboard in the background. When you copy links from YouTube, TikTok, or emails, it removes 250+ tracking tokens (fbclid, utm_*, si) in &lt;1ms.
               </p>
             </div>
-            <button
-              aria-label="Toggle Clipboard Sanitizer"
-              onclick={() => handleToggle("clipboard", status.clipboard_cleaner)}
-              class="w-12 h-6 rounded-full transition-colors relative shrink-0 {status.clipboard_cleaner ? 'bg-indigo-500' : 'bg-slate-700'}"
-            >
-              <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.clipboard_cleaner ? 'translate-x-6' : ''}"></span>
-            </button>
+            <div class="text-[10px] text-indigo-400/90 bg-indigo-950/40 p-2 rounded-lg border border-indigo-800/30">
+              🛡️ <strong>Threat stopped:</strong> Link tracking & identity tagging when sharing URLs.
+            </div>
           </div>
 
           <!-- Module 5: OS System Proxy Integration -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex items-start justify-between">
-            <div class="space-y-1 pr-4">
-              <div class="flex items-center gap-2">
-                <Activity class="w-4 h-4 text-blue-400" />
-                <span class="text-sm font-semibold text-slate-200">System Proxy Auto-Routing</span>
+          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
+            <div>
+              <div class="flex items-center justify-between mb-2">
+                <div class="flex items-center gap-2">
+                  <Activity class="w-4 h-4 text-blue-400" />
+                  <span class="text-sm font-semibold text-slate-200">OS Proxy Auto-Routing (:1080)</span>
+                </div>
+                <button
+                  aria-label="Toggle System Proxy"
+                  onclick={() => handleToggle("proxy", status.proxy_enabled)}
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.proxy_enabled ? 'bg-blue-500' : 'bg-slate-700'}"
+                >
+                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.proxy_enabled ? 'translate-x-5' : ''}"></span>
+                </button>
               </div>
-              <p class="text-xs text-slate-400 leading-relaxed">
-                Applies system-wide HTTP & SOCKS5 proxy settings to 127.0.0.1:1080 without requiring root/sudo privileges.
+              <p class="text-xs text-slate-400 leading-relaxed mb-3">
+                Automatically instructs macOS to route HTTP, HTTPS, and SOCKS5 connections through your local shield daemon. Automatically resets to direct connection on quit.
               </p>
             </div>
-            <button
-              aria-label="Toggle System Proxy"
-              onclick={() => handleToggle("proxy", status.proxy_enabled)}
-              class="w-12 h-6 rounded-full transition-colors relative shrink-0 {status.proxy_enabled ? 'bg-blue-500' : 'bg-slate-700'}"
-            >
-              <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.proxy_enabled ? 'translate-x-6' : ''}"></span>
-            </button>
+            <div class="text-[10px] text-blue-400/90 bg-blue-950/40 p-2 rounded-lg border border-blue-800/30">
+              🛡️ <strong>Status:</strong> {status.os_proxy_active ? "Actively routing OS traffic" : "Inactive in OS settings"}
+            </div>
           </div>
 
           <!-- Module 6: PII & Secret Redactor -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex items-start justify-between">
-            <div class="space-y-1 pr-4">
-              <div class="flex items-center gap-2">
-                <ShieldCheck class="w-4 h-4 text-cyan-400" />
-                <span class="text-sm font-semibold text-slate-200">Chat & LLM PII Masker</span>
+          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
+            <div>
+              <div class="flex items-center justify-between mb-2">
+                <div class="flex items-center gap-2">
+                  <ShieldCheck class="w-4 h-4 text-cyan-400" />
+                  <span class="text-sm font-semibold text-slate-200">AI & Chat PII Masker</span>
+                </div>
+                <button
+                  aria-label="Toggle Chat PII Masker"
+                  onclick={() => handleToggle("pii", status.pii_redactor)}
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.pii_redactor ? 'bg-cyan-500' : 'bg-slate-700'}"
+                >
+                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.pii_redactor ? 'translate-x-5' : ''}"></span>
+                </button>
               </div>
-              <p class="text-xs text-slate-400 leading-relaxed">
-                Automatically masks credit cards (Luhn validated), emails, phone numbers, and API keys before sending to AI or web chats.
+              <p class="text-xs text-slate-400 leading-relaxed mb-3">
+                Masks credit card numbers (Luhn validated), API keys, passwords, emails, and phone numbers before they are sent to AI chat models like ChatGPT or Claude.
               </p>
             </div>
-            <button
-              aria-label="Toggle Chat PII Masker"
-              onclick={() => handleToggle("pii", status.pii_redactor)}
-              class="w-12 h-6 rounded-full transition-colors relative shrink-0 {status.pii_redactor ? 'bg-cyan-500' : 'bg-slate-700'}"
-            >
-              <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.pii_redactor ? 'translate-x-6' : ''}"></span>
-            </button>
+            <div class="text-[10px] text-cyan-400/90 bg-cyan-950/40 p-2 rounded-lg border border-cyan-800/30">
+              🛡️ <strong>Threat stopped:</strong> Data leakage to AI model training sets.
+            </div>
           </div>
         </div>
       </div>
@@ -578,17 +781,17 @@
         <div>
           <h2 class="text-base font-bold text-slate-100 flex items-center gap-2">
             <Lock class="w-5 h-5 text-cyan-400" />
-            AI & Web Chat Data Privacy Sandbox
+            AI & Chat Privacy Shield
           </h2>
-          <p class="text-xs text-slate-400">
-            Paste any sensitive prompt below to test zero-latency local pseudonymization and bidirectional de-tokenization.
+          <p class="text-xs text-slate-400 mt-1">
+            Before pasting your code or queries into ChatGPT, Claude, or Copilot, sanitize them here. Sensitive data is replaced with anonymous tokens that can be restored with 1 click after the AI responds.
           </p>
         </div>
 
         <div class="grid grid-cols-2 gap-4">
           <!-- Input Box -->
           <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col">
-            <label class="text-xs font-semibold text-slate-300 mb-2">Original Prompt (Before Sending to AI)</label>
+            <span class="text-xs font-semibold text-slate-300 mb-2 block">1. Your Original Prompt (Sensitive Data Stays Local)</span>
             <textarea
               bind:value={sandboxInput}
               class="flex-1 w-full bg-slate-950/80 border border-slate-800 rounded-xl p-3 text-xs font-mono text-slate-200 resize-none focus:outline-none focus:border-cyan-500 min-h-[160px]"
@@ -598,22 +801,22 @@
               class="mt-3 px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-xs font-semibold text-white transition-colors flex items-center justify-center gap-2"
             >
               <Zap class="w-3.5 h-3.5" />
-              Redact PII & Secrets
+              Scrub Secrets & Sensitive Data
             </button>
           </div>
 
           <!-- Output Box -->
           <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col">
             <div class="flex items-center justify-between mb-2">
-              <label class="text-xs font-semibold text-cyan-300">Sanitized Prompt (What the LLM Sees)</label>
+              <span class="text-xs font-semibold text-cyan-300">2. Sanitized Prompt (Safe to Paste to AI)</span>
               {#if sandboxResult}
                 <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-cyan-950 text-cyan-300 border border-cyan-800/60">
-                  {sandboxResult.redactions_count} Entities Masked
+                  {sandboxResult.redactions_count} Secrets Masked
                 </span>
               {/if}
             </div>
-            <div class="flex-1 w-full bg-slate-950/80 border border-slate-800 rounded-xl p-3 text-xs font-mono text-slate-300 overflow-y-auto min-h-[160px] whitespace-pre-wrap">
-              {sandboxResult?.sanitized_text || "Click 'Redact PII' to test..."}
+            <div class="flex-1 w-full bg-slate-950/80 border border-slate-800 rounded-xl p-3 text-xs font-mono text-slate-300 overflow-y-auto min-h-[160px] whitespace-pre-wrap select-all">
+              {sandboxResult?.sanitized_text || "Click 'Scrub Secrets' to generate sanitized text..."}
             </div>
             <button
               onclick={runSandboxRestore}
@@ -621,18 +824,18 @@
               class="mt-3 px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
             >
               <RefreshCw class="w-3.5 h-3.5" />
-              Test Local De-tokenization (Restore Original)
+              3. Un-mask AI Answer (Restore Real Data)
             </button>
           </div>
         </div>
 
         {#if sandboxResult && Object.keys(sandboxResult.token_map).length > 0}
           <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
-            <h4 class="text-xs font-semibold text-slate-300 mb-2">In-Memory Pseudonymization Map (Strictly Local)</h4>
+            <h4 class="text-xs font-semibold text-slate-300 mb-2">In-Memory Secret Vault (RAM Only, Never Sent Anywhere)</h4>
             <div class="grid grid-cols-2 gap-2">
               {#each Object.entries(sandboxResult.token_map) as [token, orig]}
                 <div class="bg-slate-950/80 border border-slate-800 rounded-lg p-2 text-xs font-mono flex items-center justify-between">
-                  <span class="text-cyan-400">{token}</span>
+                  <span class="text-cyan-400 font-bold">{token}</span>
                   <span class="text-slate-500 truncate max-w-[240px]">{orig}</span>
                 </div>
               {/each}
@@ -644,9 +847,9 @@
           <div class="bg-slate-900/60 border border-emerald-800/40 rounded-2xl p-4">
             <h4 class="text-xs font-semibold text-emerald-400 mb-1 flex items-center gap-1.5">
               <CheckCircle class="w-4 h-4" />
-              Restored Prompt
+              Restored AI Response (Original Sensitive Values Re-inserted):
             </h4>
-            <p class="text-xs font-mono text-slate-200">{sandboxRestored}</p>
+            <p class="text-xs font-mono text-slate-200 select-all">{sandboxRestored}</p>
           </div>
         {/if}
       </div>
@@ -656,16 +859,16 @@
         <div>
           <h2 class="text-base font-bold text-slate-100 flex items-center gap-2">
             <Filter class="w-5 h-5 text-indigo-400" />
-            Universal Link De-tracker
+            Tracking Link Stripper
           </h2>
-          <p class="text-xs text-slate-400">
-            This module automatically runs in the background for your system clipboard. Test any URL below to see how tracking parameters are eradicated.
+          <p class="text-xs text-slate-400 mt-1">
+            Social networks (Facebook, Twitter, TikTok, YouTube) and email marketing platforms append tracking identifiers to links. Our background clipboard guard automatically strips them whenever you copy any link. You can also test any URL manually below:
           </p>
         </div>
 
         <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 space-y-4 shadow-lg">
           <div>
-            <label class="text-xs font-medium text-slate-300 block mb-1.5">Input URL with Tracking Parameters</label>
+            <span class="text-xs font-medium text-slate-300 block mb-1.5">Input URL with Tracking Parameters</span>
             <input
               type="text"
               bind:value={testUrlInput}
@@ -678,16 +881,16 @@
             class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white transition-colors flex items-center gap-2"
           >
             <Filter class="w-3.5 h-3.5" />
-            Clean Tracking Tokens
+            Strip Tracking Parameters
           </button>
 
           {#if testUrlCleaned}
             <div class="pt-2 border-t border-slate-800/80">
               <div class="text-xs font-semibold text-indigo-300 mb-1 flex items-center gap-1.5">
                 <CheckCircle class="w-4 h-4 text-emerald-400" />
-                Sanitized URL Result:
+                Sanitized URL (Clean &amp; Safe to Share):
               </div>
-              <div class="bg-slate-950/90 border border-slate-800 rounded-xl p-3 text-xs font-mono text-slate-200 break-all select-all">
+              <div class="bg-slate-950/90 border border-slate-800 rounded-xl p-3 text-xs font-mono text-emerald-300 break-all select-all">
                 {testUrlCleaned}
               </div>
             </div>
@@ -700,10 +903,10 @@
         <div>
           <h2 class="text-base font-bold text-slate-100 flex items-center gap-2">
             <Layers class="w-5 h-5 text-cyan-400" />
-            Cross-Platform OS Telemetry Silencer
+            Operating System Telemetry Audit
           </h2>
-          <p class="text-xs text-slate-400">
-            Operating systems continuously phone home with diagnostic telemetry and machine identifiers. Below are the monitored profiles handled by the local DNS sinkhole.
+          <p class="text-xs text-slate-400 mt-1">
+            macOS, Windows, and Linux operating systems continuously ping diagnostic servers with unique machine IDs and crash telemetry. Below is the list of OS telemetry endpoints blocked by your local DNS sinkhole:
           </p>
         </div>
 
@@ -719,7 +922,7 @@
                 </div>
                 <p class="text-xs text-slate-400 leading-relaxed">{item.description}</p>
               </div>
-              <span class="text-[10px] font-mono px-2 py-1 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/60 shrink-0">
+              <span class="text-[10px] font-mono px-2 py-1 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/60 shrink-0 font-semibold">
                 SINKHOLED
               </span>
             </div>
@@ -734,7 +937,11 @@
     <div class="flex items-center gap-3">
       <span>UPSTREAM: {status.upstream_resolver}</span>
       <span>•</span>
-      <span>CHAFF: {status.chaff_intensity}</span>
+      <span>CAMOUFLAGE: {status.chaff_intensity}</span>
+      <span>•</span>
+      <span class={status.os_proxy_active ? "text-emerald-400" : "text-amber-400"}>
+        OS ROUTING: {status.os_proxy_active ? "ACTIVE" : "INACTIVE"}
+      </span>
     </div>
     <div>ZERO-KNOWLEDGE RAM ARCHITECTURE • NO DISK LOGS</div>
   </footer>

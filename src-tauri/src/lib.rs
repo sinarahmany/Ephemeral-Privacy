@@ -33,6 +33,7 @@ pub struct AppConfigStatus {
     pub pii_redactor: bool,
     pub chaff_intensity: String,
     pub upstream_resolver: String,
+    pub os_proxy_active: bool,
 }
 
 #[tauri::command]
@@ -43,6 +44,7 @@ async fn get_privacy_status(state: State<'_, Arc<AppState>>) -> Result<AppConfig
         ChaffIntensity::HeavyFog => "HeavyFog",
     };
     let resolver_str = state.upstream_resolver.read().await.clone();
+    let os_proxy_active = sysproxy::Sysproxy::get_system_proxy().map(|p| p.enable).unwrap_or(false);
 
     Ok(AppConfigStatus {
         proxy_enabled: state.proxy_enabled.load(Ordering::Relaxed),
@@ -53,6 +55,7 @@ async fn get_privacy_status(state: State<'_, Arc<AppState>>) -> Result<AppConfig
         pii_redactor: state.pii_redactor.load(Ordering::Relaxed),
         chaff_intensity: intensity_str.to_string(),
         upstream_resolver: resolver_str,
+        os_proxy_active,
     })
 }
 
@@ -132,6 +135,24 @@ async fn set_chaff_intensity(
 }
 
 #[tauri::command]
+async fn reassert_system_proxy(state: State<'_, Arc<AppState>>) -> Result<bool, String> {
+    if state.proxy_enabled.load(Ordering::Relaxed) {
+        enable_system_proxy(1080)?;
+        state
+            .log_event(
+                "SYSTEM_PROXY_ASSERTED",
+                "OS Proxy Routing Re-asserted",
+                "Ensured system proxy is actively routing network traffic through 127.0.0.1:1080",
+                "127.0.0.1",
+            )
+            .await;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[tauri::command]
 async fn trigger_manual_chaff_burst(
     state: State<'_, Arc<AppState>>,
     decorrelator: State<'_, Arc<DecorrelatorEngine>>,
@@ -190,6 +211,7 @@ pub fn run() {
             get_privacy_metrics,
             get_recent_events,
             toggle_feature,
+            reassert_system_proxy,
             set_chaff_intensity,
             trigger_manual_chaff_burst,
             trigger_panic,
@@ -204,7 +226,11 @@ pub fn run() {
                 doh_pool.clone(),
                 decorrelator.clone(),
             );
-            let proxy_server = ProxyServer::new(app_state.clone(), decorrelator.clone());
+            let proxy_server = ProxyServer::new(
+                app_state.clone(),
+                decorrelator.clone(),
+                doh_pool.clone(),
+            );
 
             // Spawn Background DNS Server with auto-port fallback (5300, 1053, etc.)
             tauri::async_runtime::spawn(async move {

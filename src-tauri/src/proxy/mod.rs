@@ -2,6 +2,7 @@ pub mod dpi_bypass;
 pub mod sys_proxy;
 
 use crate::decorrelator::DecorrelatorEngine;
+use crate::dns::doh_pool::DohPool;
 use crate::dns::sinkhole::is_tracker;
 use crate::proxy::dpi_bypass::send_fragmented_client_hello;
 use crate::state::AppState;
@@ -14,13 +15,19 @@ use tokio::net::{TcpListener, TcpStream};
 pub struct ProxyServer {
     state: Arc<AppState>,
     decorrelator: Arc<DecorrelatorEngine>,
+    doh_pool: DohPool,
 }
 
 impl ProxyServer {
-    pub fn new(state: Arc<AppState>, decorrelator: Arc<DecorrelatorEngine>) -> Self {
+    pub fn new(
+        state: Arc<AppState>,
+        decorrelator: Arc<DecorrelatorEngine>,
+        doh_pool: DohPool,
+    ) -> Self {
         Self {
             state,
             decorrelator,
+            doh_pool,
         }
     }
 
@@ -42,11 +49,44 @@ impl ProxyServer {
 
             let state = self.state.clone();
             let decorrelator = self.decorrelator.clone();
+            let doh_pool = self.doh_pool.clone();
             tokio::spawn(async move {
-                let _ = handle_client(stream, client_addr, state, decorrelator).await;
+                let _ = handle_client(stream, client_addr, state, decorrelator, doh_pool).await;
             });
         }
     }
+}
+
+async fn connect_with_doh(
+    host: &str,
+    port: u16,
+    doh_pool: &DohPool,
+    state: &AppState,
+) -> Result<TcpStream, std::io::Error> {
+    // 1. Attempt Encrypted DoH Resolution to blind ISP from plaintext DNS
+    if let Ok(ip) = doh_pool.resolve_ip(host).await {
+        let addr = SocketAddr::new(ip, port);
+        match TcpStream::connect(addr).await {
+            Ok(s) => {
+                state
+                    .log_event(
+                        "DOH_RESOLVED",
+                        "Encrypted DoH Resolution",
+                        &format!("Blinded ISP: Resolved {} -> {} over encrypted DoH", host, ip),
+                        host,
+                    )
+                    .await;
+                return Ok(s);
+            }
+            Err(_) => {
+                // Fallback to name-based connect if direct IP connect fails
+            }
+        }
+    }
+
+    // 2. Fallback to standard connection if DoH failed or for internal hostnames
+    let target = format!("{}:{}", host, port);
+    TcpStream::connect(&target).await
 }
 
 async fn handle_client(
@@ -54,6 +94,7 @@ async fn handle_client(
     _client_addr: SocketAddr,
     state: Arc<AppState>,
     decorrelator: Arc<DecorrelatorEngine>,
+    doh_pool: DohPool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut initial_buf = [0u8; 4096];
     let n = client_stream.read(&mut initial_buf).await?;
@@ -63,7 +104,7 @@ async fn handle_client(
 
     // 1. SOCKS5 HANDSHAKE DETECTION (RFC 1928)
     if initial_buf[0] == 0x05 {
-        return handle_socks5(client_stream, &initial_buf[..n], state, decorrelator).await;
+        return handle_socks5(client_stream, &initial_buf[..n], state, decorrelator, doh_pool).await;
     }
 
     let request_head = String::from_utf8_lossy(&initial_buf[..n]);
@@ -109,8 +150,14 @@ async fn handle_client(
             )
             .await;
 
-        // Connect to upstream destination
-        let mut target_stream = match TcpStream::connect(target_host_port).await {
+        // Connect to upstream destination via encrypted DoH (blinds ISP from DNS)
+        let port: u16 = target_host_port
+            .split(':')
+            .nth(1)
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(443);
+
+        let mut target_stream = match connect_with_doh(host, port, &doh_pool, &state).await {
             Ok(s) => s,
             Err(e) => {
                 client_stream
@@ -205,13 +252,13 @@ async fn handle_client(
             )
             .await;
 
-        let target_addr = if host.contains(':') {
-            host.to_string()
+        let (host_str, port) = if let Some((h, p)) = host.split_once(':') {
+            (h, p.parse::<u16>().unwrap_or(80))
         } else {
-            format!("{}:80", host)
+            (host, 80)
         };
 
-        if let Ok(mut target_stream) = TcpStream::connect(&target_addr).await {
+        if let Ok(mut target_stream) = connect_with_doh(host_str, port, &doh_pool, &state).await {
             target_stream.write_all(&initial_buf[..n]).await?;
             let (mut cr, mut cw) = client_stream.into_split();
             let (mut tr, mut tw) = target_stream.into_split();
@@ -238,6 +285,7 @@ async fn handle_socks5(
     initial_buf: &[u8],
     state: Arc<AppState>,
     decorrelator: Arc<DecorrelatorEngine>,
+    doh_pool: DohPool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // SOCKS5 Greeting: client sent [0x05, nmethods, ...methods]
     if initial_buf.len() < 2 || initial_buf[0] != 0x05 {
@@ -304,9 +352,8 @@ async fn handle_socks5(
         return Ok(());
     }
 
-    // Connect to destination
-    let target_addr = format!("{}:{}", target_host, target_port);
-    let mut target_stream = match TcpStream::connect(&target_addr).await {
+    // Connect to destination via encrypted DoH
+    let mut target_stream = match connect_with_doh(&target_host, target_port, &doh_pool, &state).await {
         Ok(s) => s,
         Err(e) => {
             // Host unreachable (0x04)

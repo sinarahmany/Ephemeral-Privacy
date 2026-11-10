@@ -1,5 +1,8 @@
 use rand::seq::IndexedRandom;
 use reqwest::Client;
+use simple_dns::rdata::RData;
+use simple_dns::{Name, Packet, Question, CLASS, QCLASS, QTYPE, TYPE};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -97,5 +100,43 @@ impl DohPool {
             .map_err(|e| format!("Failed reading DoH response: {}", e))?;
 
         Ok(bytes.to_vec())
+    }
+
+    /// Performs an encrypted DNS over HTTPS resolution to retrieve an IP for a domain.
+    /// This blinds the local ISP from seeing any plaintext DNS queries for visited websites.
+    pub async fn resolve_ip(&self, domain: &str) -> Result<IpAddr, String> {
+        let clean = domain.trim_end_matches('.');
+        // Check if already an IP
+        if let Ok(ip) = clean.parse::<IpAddr>() {
+            return Ok(ip);
+        }
+
+        let name = Name::new(clean).map_err(|e| e.to_string())?;
+        let mut query = Packet::new_query(rand::random());
+        query.questions.push(Question::new(
+            name,
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        let raw_packet = query.build_bytes_vec_compressed().map_err(|e| e.to_string())?;
+
+        let resolver = self.next_resolver();
+        let resp_bytes = self.query_doh(&raw_packet, resolver).await?;
+        let parsed = Packet::parse(&resp_bytes).map_err(|e| e.to_string())?;
+
+        for ans in &parsed.answers {
+            match &ans.rdata {
+                RData::A(a) => {
+                    return Ok(IpAddr::V4(std::net::Ipv4Addr::from(a.address)));
+                }
+                RData::AAAA(aaaa) => {
+                    return Ok(IpAddr::V6(std::net::Ipv6Addr::from(aaaa.address)));
+                }
+                _ => {}
+            }
+        }
+
+        Err(format!("No IP address found for {}", clean))
     }
 }

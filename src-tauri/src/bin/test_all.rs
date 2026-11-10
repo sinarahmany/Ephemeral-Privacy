@@ -85,7 +85,7 @@ async fn main() {
 
     // TEST 4: SOCKS5 & HTTP Proxy Interception & Chaff Triggering
     println!("\n[4/6] Testing Proxy Server (127.0.0.1:1080)...");
-    let proxy_server = ProxyServer::new(state.clone(), decorrelator.clone());
+    let proxy_server = ProxyServer::new(state.clone(), decorrelator.clone(), doh_pool.clone());
     let proxy_bind = "127.0.0.1:1080".parse().unwrap();
     tokio::spawn(async move {
         let _ = proxy_server.run(proxy_bind).await;
