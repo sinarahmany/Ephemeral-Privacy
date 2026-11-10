@@ -27,7 +27,7 @@ impl DecorrelatorEngine {
         let state = self.state.clone();
         let doh_pool = self.doh_pool.clone();
 
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             let intensity = {
                 let guard = state.chaff_intensity.read().await;
                 guard.clone()

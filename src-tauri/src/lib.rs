@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tauri::{Manager, State};
+use tauri::State;
 
 #[derive(Serialize, Deserialize)]
 pub struct AppConfigStatus {
@@ -178,32 +178,6 @@ pub fn run() {
     let doh_pool = DohPool::new();
     let decorrelator = Arc::new(DecorrelatorEngine::new(app_state.clone(), doh_pool.clone()));
 
-    let dns_server = DnsServer::new(
-        app_state.clone(),
-        doh_pool.clone(),
-        decorrelator.clone(),
-    );
-    let proxy_server = ProxyServer::new(app_state.clone());
-
-    // Spawn Background DNS Server on 127.0.0.1:5353
-    let dns_bind: SocketAddr = "127.0.0.1:5353".parse().unwrap();
-    tokio::spawn(async move {
-        if let Err(e) = dns_server.run(dns_bind).await {
-            eprintln!("DNS Server error: {}", e);
-        }
-    });
-
-    // Spawn Background Proxy Server on 127.0.0.1:1080
-    let proxy_bind: SocketAddr = "127.0.0.1:1080".parse().unwrap();
-    tokio::spawn(async move {
-        if let Err(e) = proxy_server.run(proxy_bind).await {
-            eprintln!("Proxy Server error: {}", e);
-        }
-    });
-
-    // Start background clipboard de-tracker
-    start_clipboard_monitor(app_state.clone());
-
     let state_for_setup = app_state.clone();
     let decorrelator_for_setup = decorrelator.clone();
 
@@ -224,12 +198,35 @@ pub fn run() {
             restore_pii_prompt,
             get_os_telemetry_list
         ])
-        .setup(|app| {
-            // Log initial start
-            let handle = app.handle();
-            let state = handle.state::<Arc<AppState>>();
-            let state_clone = state.inner().clone();
-            tokio::spawn(async move {
+        .setup(move |_app| {
+            let dns_server = DnsServer::new(
+                app_state.clone(),
+                doh_pool.clone(),
+                decorrelator.clone(),
+            );
+            let proxy_server = ProxyServer::new(app_state.clone());
+
+            // Spawn Background DNS Server with auto-port fallback (5300, 1053, etc.)
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = dns_server.run_auto().await {
+                    eprintln!("DNS Server error: {}", e);
+                }
+            });
+
+            // Spawn Background Proxy Server on 127.0.0.1:1080 within Tauri async runtime
+            let proxy_bind: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = proxy_server.run(proxy_bind).await {
+                    eprintln!("Proxy Server error: {}", e);
+                }
+            });
+
+            // Start background clipboard monitor (uses thread::spawn internally)
+            start_clipboard_monitor(app_state.clone());
+
+            // Log startup
+            let state_clone = app_state.clone();
+            tauri::async_runtime::spawn(async move {
                 state_clone
                     .log_event(
                         "SYSTEM_STARTUP",
@@ -239,6 +236,7 @@ pub fn run() {
                     )
                     .await;
             });
+
             Ok(())
         })
         .run(tauri::generate_context!())

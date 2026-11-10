@@ -207,7 +207,7 @@
           <span class="text-slate-600">•</span>
           <span class="font-mono text-slate-300">Proxy :1080</span>
           <span class="text-slate-600">•</span>
-          <span class="font-mono text-slate-300">DNS :5353</span>
+          <span class="font-mono text-slate-300">DNS :5300</span>
         </div>
       </div>
     </div>
@@ -499,7 +499,7 @@
                 <span class="text-sm font-semibold text-slate-200">DNS Sinkhole & CNAME Uncloaker</span>
               </div>
               <p class="text-xs text-slate-400 leading-relaxed">
-                Sinkholes ad/tracking servers system-wide on 127.0.0.1:5353. Unmasks first-party CNAME cloaking used to evade traditional ad-blockers.
+                Sinkholes ad/tracking servers system-wide on 127.0.0.1:5300. Unmasks first-party CNAME cloaking used to evade traditional ad-blockers.
               </p>
             </div>
             <button

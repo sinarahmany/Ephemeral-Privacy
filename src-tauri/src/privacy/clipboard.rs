@@ -94,7 +94,7 @@ pub fn sanitize_url(raw: &str) -> Option<String> {
 
 /// Background loop monitoring system clipboard for tracking URLs
 pub fn start_clipboard_monitor(state: Arc<AppState>) {
-    tokio::task::spawn_blocking(move || {
+    std::thread::spawn(move || {
         let mut last_seen = String::new();
 
         loop {
@@ -125,7 +125,7 @@ pub fn start_clipboard_monitor(state: Arc<AppState>) {
                     last_seen = cleaned.clone();
 
                     let state_clone = state.clone();
-                    tokio::spawn(async move {
+                    tauri::async_runtime::spawn(async move {
                         state_clone
                             .log_event(
                                 "URL_SANITIZED",

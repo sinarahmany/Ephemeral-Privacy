@@ -32,46 +32,54 @@ impl DnsServer {
         }
     }
 
-    pub async fn run(&self, bind_addr: SocketAddr) -> Result<(), String> {
-        let socket = UdpSocket::bind(bind_addr)
-            .await
-            .map_err(|e| format!("Failed to bind DNS UDP server on {}: {}", bind_addr, e))?;
+    pub async fn run_auto(&self) -> Result<u16, String> {
+        let candidate_ports = [5300, 1053, 5354, 8553];
+        for port in candidate_ports {
+            let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+            match UdpSocket::bind(addr).await {
+                Ok(socket) => {
+                    println!("[DNS] Bound successfully on 127.0.0.1:{}", port);
+                    let socket = Arc::new(socket);
+                    let mut buf = [0u8; 4096];
 
-        let socket = Arc::new(socket);
-        let mut buf = [0u8; 4096];
+                    loop {
+                        let (len, client_addr) = match socket.recv_from(&mut buf).await {
+                            Ok(res) => res,
+                            Err(e) => {
+                                eprintln!("DNS recv error: {}", e);
+                                continue;
+                            }
+                        };
 
-        loop {
-            let (len, client_addr) = match socket.recv_from(&mut buf).await {
-                Ok(res) => res,
-                Err(e) => {
-                    eprintln!("DNS recv error: {}", e);
+                        if !self.state.dns_enabled.load(Ordering::Relaxed) {
+                            continue;
+                        }
+
+                        let query_bytes = buf[..len].to_vec();
+                        let socket_clone = socket.clone();
+                        let state = self.state.clone();
+                        let doh_pool = self.doh_pool.clone();
+                        let decorrelator = self.decorrelator.clone();
+
+                        tokio::spawn(async move {
+                            handle_dns_query(
+                                query_bytes,
+                                client_addr,
+                                socket_clone,
+                                state,
+                                doh_pool,
+                                decorrelator,
+                            )
+                            .await;
+                        });
+                    }
+                }
+                Err(_) => {
                     continue;
                 }
-            };
-
-            if !self.state.dns_enabled.load(Ordering::Relaxed) {
-                // If DNS module disabled, forward raw to default resolver
-                continue;
             }
-
-            let query_bytes = buf[..len].to_vec();
-            let socket_clone = socket.clone();
-            let state = self.state.clone();
-            let doh_pool = self.doh_pool.clone();
-            let decorrelator = self.decorrelator.clone();
-
-            tokio::spawn(async move {
-                handle_dns_query(
-                    query_bytes,
-                    client_addr,
-                    socket_clone,
-                    state,
-                    doh_pool,
-                    decorrelator,
-                )
-                .await;
-            });
         }
+        Err("Failed to bind DNS UDP server on any candidate port (5300, 1053, 5354)".into())
     }
 }
 
