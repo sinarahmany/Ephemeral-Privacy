@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Manager, State};
 
 #[derive(Serialize, Deserialize)]
 pub struct AppConfigStatus {
@@ -194,7 +194,23 @@ fn get_os_telemetry_list() -> Vec<OsTelemetryItem> {
     get_telemetry_profiles()
 }
 
+extern "C" fn atexit_cleanup() {
+    let _ = disable_system_proxy();
+}
+
 pub fn run() {
+    // 1. Register atexit handler so proxy is always restored on any process exit
+    unsafe {
+        libc::atexit(atexit_cleanup);
+    }
+
+    // 2. Register panic hook to restore direct connection on panic
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = disable_system_proxy();
+        default_hook(panic_info);
+    }));
+
     let app_state = Arc::new(AppState::new());
     let doh_pool = DohPool::new();
     let decorrelator = Arc::new(DecorrelatorEngine::new(app_state.clone(), doh_pool.clone()));
@@ -206,6 +222,16 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(state_for_setup)
         .manage(decorrelator_for_setup)
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                println!("[SHUTDOWN] Window close requested, restoring direct connection...");
+                let _ = disable_system_proxy();
+                window.app_handle().exit(0);
+            }
+            if let tauri::WindowEvent::Destroyed = event {
+                let _ = disable_system_proxy();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_privacy_status,
             get_privacy_metrics,
@@ -288,14 +314,24 @@ pub fn run() {
                 }
             });
 
+            #[cfg(unix)]
+            tauri::async_runtime::spawn(async {
+                use tokio::signal::unix::{signal, SignalKind};
+                if let Ok(mut hup) = signal(SignalKind::hangup()) {
+                    hup.recv().await;
+                    let _ = disable_system_proxy();
+                }
+            });
+
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app_handle, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
+        .run(|_app_handle, event| match event {
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
                 let _ = disable_system_proxy();
-                println!("[SYSTEM] Reset OS proxy to direct connection.");
+                println!("[SYSTEM] Reset OS proxy to direct connection on exit.");
             }
+            _ => {}
         });
 }
