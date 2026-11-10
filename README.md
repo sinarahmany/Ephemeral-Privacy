@@ -57,3 +57,4 @@ npm run tauri dev
 # Build production bundle
 npm run tauri build
 ```
+# Ephemeral-Privacy
