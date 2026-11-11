@@ -1,8 +1,8 @@
 # Ephemeral Privacy Suite
 
-A fast, RAM-only macOS privacy proxy and local shield built with **Rust**, **Tauri v2**, and **Svelte 5** — for people who don't think their ISP, ad brokers, or random Electron apps need a timestamped diary of everything they open.
+Trying to check the weather or look up a quick question online shouldn't wake up 40 ad brokers, analytics scripts disguised as first-party subdomains, passive browser fingerprinting, and an ISP logging every domain you visit. Between intrusive ads, silent CNAME tracking, and apps quietly phoning home all day, normal browsing feels way more exposed than it needs to be.
 
-It intercepts HTTP, HTTPS, and SOCKS5 traffic locally on `127.0.0.1:1080` (plus a local DNS responder on `127.0.0.1:5300`), drops trackers before the TCP handshake happens, hides DNS lookups behind **Oblivious DoH (RFC 9230)** relays, fragments TLS `ClientHello` packets to confuse stateless DPI boxes, watches your camera and mic without nag popups, and — most importantly — **actually cleans up macOS Wi-Fi proxy settings when you quit** so you don't think your internet died.
+**Ephemeral Privacy Suite** is a fast, RAM-only macOS privacy proxy and local shield built with **Rust**, **Tauri v2**, and **Svelte 5** to push back without breaking your connection or writing history to disk. It routes browser and proxy-aware traffic locally (`127.0.0.1:1080` + UDP `:5300`), drops ads and CNAME-cloaked trackers before they connect, separates your IP from your DNS lookups with **Oblivious DoH (RFC 9230)** relays, fragments TLS `ClientHello` headers against single-packet ISP sniffers, sprinkles in fake decoy traffic, watches camera and mic hardware silently, and — critically — cleans up macOS Wi-Fi proxy settings when you quit so it never strands your internet.
 
 ![Ephemeral Privacy Overview](docs/screenshots/overview.png)
 
@@ -65,15 +65,15 @@ flowchart LR
 
 ---
 
-## Honest Disclaimers (Stuff We Won't Pretend to Do)
+## Honest Disclaimers (Stuff I Won't Pretend This Does)
 
-We ran an adversarial red-team audit on our own app ([`BUG_REPORT.md`](BUG_REPORT.md)) — including catching an embarrassing bug where newly built DNS packets defaulted to `RD=0` (Recursion Desired = false) until fixed in `BUG-18` — because lying in security UI copy is worse than missing a feature.
+I ran an adversarial red-team audit on my own app ([`BUG_REPORT.md`](BUG_REPORT.md)) — including catching an embarrassing bug where newly built DNS packets defaulted to `RD=0` (Recursion Desired = false) until fixed in `BUG-18` — because lying in security UI copy is worse than missing a feature.
 
 Here is the unvarnished scope of running an unprivileged user-space proxy (without root, a kernel TUN driver, or installing a MITM root certificate):
 
 - **Non-proxy CLI/UDP apps bypass `:1080`:** macOS routes Safari, Chrome, and proxy-aware apps through `127.0.0.1:1080`, while direct terminal UDP/raw sockets use macOS system DNS unless explicitly pointed at the proxy or `:5300`.
 - **WebRTC needs browser backup:** The proxy blocks STUN/TURN and SOCKS5 UDP over `:1080`, but browsers can still send direct OS UDP ICE probes unless you also enable *"Disable non-proxied UDP"* in browser settings (or run a system VPN).
-- **Browser HTTPS ciphers stay native:** Shuffling browser TLS ciphers mid-flight breaks TLS `Finished` verification unless you MITM every site with a custom root CA. We rotate TLS fingerprints on *our* outbound DoH/ODoH/chaff traffic and scrub plain-HTTP headers, while leaving browser HTTPS keys end-to-end untouched.
+- **Browser HTTPS ciphers stay native:** Shuffling browser TLS ciphers mid-flight breaks TLS `Finished` verification unless an app MITMs every site with a custom root CA. Instead, I rotate TLS fingerprints on the app's own outbound DoH/ODoH/chaff traffic and scrub plain-HTTP headers, while leaving browser HTTPS keys end-to-end untouched.
 - **SNI splitting targets single-packet DPI:** Stateful DPI boxes that reassemble multi-record TLS streams across TCP still see plaintext SNI unless the browser/server negotiates Encrypted Client Hello (ECH).
 
 ---
