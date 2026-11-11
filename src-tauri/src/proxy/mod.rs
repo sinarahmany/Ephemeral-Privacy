@@ -1,10 +1,14 @@
 pub mod dpi_bypass;
+pub mod fingerprint;
 pub mod sys_proxy;
+pub mod webrtc_shield;
 
 use crate::decorrelator::DecorrelatorEngine;
 use crate::dns::doh_pool::DohPool;
 use crate::dns::sinkhole::is_tracker;
-use crate::proxy::dpi_bypass::send_fragmented_client_hello;
+use crate::proxy::dpi_bypass::send_obfuscated_client_hello;
+use crate::proxy::fingerprint::normalize_http_request_headers;
+use crate::proxy::webrtc_shield::is_webrtc_stun_target;
 use crate::state::AppState;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -57,36 +61,134 @@ impl ProxyServer {
     }
 }
 
+async fn check_policy_block(host: &str, port: u16, proto: &str, state: &AppState) -> bool {
+    if state.webrtc_shield.load(Ordering::Relaxed) {
+        if let Some(reason) = is_webrtc_stun_target(host, Some(port)) {
+            state.webrtc_leaks_blocked.fetch_add(1, Ordering::Relaxed);
+            state
+                .log_event(
+                    "WEBRTC_BLOCKED",
+                    &format!("{} WebRTC IP Leak Blocked", proto),
+                    &format!("Dropped {}:{} ({}) to hide LAN/WAN IP", host, port, reason),
+                    host,
+                )
+                .await;
+            return true;
+        }
+    }
+
+    if let Some(tracker) = is_tracker(host) {
+        state.trackers_blocked.fetch_add(1, Ordering::Relaxed);
+        state
+            .log_event(
+                "TRACKER_BLOCKED",
+                &format!("{} Blocked Tracker: {}", proto, tracker),
+                &format!("Denied connection to {}:{}", host, port),
+                host,
+            )
+            .await;
+        return true;
+    }
+
+    false
+}
+
 async fn connect_with_doh(
     host: &str,
     port: u16,
     doh_pool: &DohPool,
     state: &AppState,
 ) -> Result<TcpStream, std::io::Error> {
-    // 1. Attempt Encrypted DoH Resolution to blind ISP from plaintext DNS
-    if let Ok(ip) = doh_pool.resolve_ip(host).await {
+    let use_odoh = state.odoh_enabled.load(Ordering::Relaxed);
+    let ja3_shuffle = state.ja3_shuffle.load(Ordering::Relaxed);
+
+    // 1. Attempt Encrypted ODoH Relay / DoH Resolution to blind ISP from plaintext DNS
+    if let Ok((ip, used_odoh, route_name)) = doh_pool.resolve_ip_smart(host, use_odoh, ja3_shuffle).await {
         let addr = SocketAddr::new(ip, port);
-        match TcpStream::connect(addr).await {
-            Ok(s) => {
+        if let Ok(s) = TcpStream::connect(addr).await {
+            if used_odoh {
+                state.odoh_queries_relayed.fetch_add(1, Ordering::Relaxed);
+                state
+                    .log_event(
+                        "ODOH_RESOLVED",
+                        "Oblivious DoH (ODoH) Relayed",
+                        &format!("Resolved {} -> {} via {}", host, ip, route_name),
+                        host,
+                    )
+                    .await;
+            } else {
                 state
                     .log_event(
                         "DOH_RESOLVED",
                         "Encrypted DoH Resolution",
-                        &format!("Blinded ISP: Resolved {} -> {} over encrypted DoH", host, ip),
+                        &format!("Blinded ISP: Resolved {} -> {} via {}", host, ip, route_name),
                         host,
                     )
                     .await;
-                return Ok(s);
             }
-            Err(_) => {
-                // Fallback to name-based connect if direct IP connect fails
-            }
+            return Ok(s);
         }
     }
 
     // 2. Fallback to standard connection if DoH failed or for internal hostnames
     let target = format!("{}:{}", host, port);
     TcpStream::connect(&target).await
+}
+
+async fn forward_tls_initial_flight(
+    client_stream: &mut TcpStream,
+    target_stream: &mut TcpStream,
+    host: &str,
+    port: u16,
+    state: &AppState,
+) -> std::io::Result<()> {
+    let mut first_packet = [0u8; 4096];
+    let bytes_read = client_stream.read(&mut first_packet).await?;
+    if bytes_read == 0 {
+        return Ok(());
+    }
+
+    let use_sni_frag = state.sni_fragmentation.load(Ordering::Relaxed);
+    let use_record_split = state.ja3_shuffle.load(Ordering::Relaxed) && port == 443;
+
+    if use_sni_frag || use_record_split {
+        let (did_obfuscate, did_record_split) = send_obfuscated_client_hello(
+            target_stream,
+            &first_packet[..bytes_read],
+            use_record_split,
+            use_sni_frag,
+        )
+        .await?;
+
+        if did_obfuscate {
+            state.sni_sliced_handshakes.fetch_add(1, Ordering::Relaxed);
+            if did_record_split {
+                state.ja3_fingerprints_shuffled.fetch_add(1, Ordering::Relaxed);
+                state
+                    .log_event(
+                        "SNI_FRAGMENTED",
+                        "Anti-DPI & Record Split Applied",
+                        &format!("Multi-record split TLS ClientHello for {} to blind ISP & passive JA3 DPI", host),
+                        host,
+                    )
+                    .await;
+            } else {
+                state
+                    .log_event(
+                        "SNI_FRAGMENTED",
+                        "Anti-DPI: SNI Packet Sliced",
+                        &format!("Fragmented TLS ClientHello for {} to blind ISP inspection", host),
+                        host,
+                    )
+                    .await;
+            }
+            return Ok(());
+        }
+    }
+
+    target_stream.write_all(&first_packet[..bytes_read]).await?;
+    target_stream.flush().await?;
+    Ok(())
 }
 
 async fn handle_client(
@@ -119,19 +221,14 @@ async fn handle_client(
 
         let target_host_port = parts[1];
         let host = target_host_port.split(':').next().unwrap_or(target_host_port);
+        let port: u16 = target_host_port
+            .split(':')
+            .nth(1)
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(443);
 
-        // Tracker Check
-        if let Some(tracker) = is_tracker(host) {
-            state.trackers_blocked.fetch_add(1, Ordering::Relaxed);
-            state
-                .log_event(
-                    "TRACKER_BLOCKED",
-                    &format!("Blocked Connection: {}", tracker),
-                    &format!("Denied HTTP CONNECT tunnel to {}", target_host_port),
-                    host,
-                )
-                .await;
-
+        // Tracker & WebRTC STUN/TURN Policy Check
+        if check_policy_block(host, port, "HTTP", &state).await {
             client_stream
                 .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                 .await?;
@@ -150,13 +247,6 @@ async fn handle_client(
             )
             .await;
 
-        // Connect to upstream destination via encrypted DoH (blinds ISP from DNS)
-        let port: u16 = target_host_port
-            .split(':')
-            .nth(1)
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(443);
-
         let mut target_stream = match connect_with_doh(host, port, &doh_pool, &state).await {
             Ok(s) => s,
             Err(e) => {
@@ -172,35 +262,9 @@ async fn handle_client(
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
 
-        // Read client's first packet (typically TLS ClientHello)
-        let mut first_packet = [0u8; 4096];
-        let bytes_read = client_stream.read(&mut first_packet).await?;
-        if bytes_read > 0 {
-            let use_sni_frag = state.sni_fragmentation.load(Ordering::Relaxed);
-            if use_sni_frag {
-                let did_frag =
-                    send_fragmented_client_hello(&mut target_stream, &first_packet[..bytes_read])
-                        .await?;
-
-                if did_frag {
-                    state.sni_sliced_handshakes.fetch_add(1, Ordering::Relaxed);
-                    state
-                        .log_event(
-                            "SNI_FRAGMENTED",
-                            "Anti-DPI: SNI Packet Sliced",
-                            &format!(
-                                "Fragmented TLS ClientHello for {} to blind ISP inspection",
-                                host
-                            ),
-                            host,
-                        )
-                        .await;
-                }
-            } else {
-                target_stream.write_all(&first_packet[..bytes_read]).await?;
-                target_stream.flush().await?;
-            }
-        }
+        // Forward initial TLS flight with SNI/Record obfuscation
+        forward_tls_initial_flight(&mut client_stream, &mut target_stream, host, port, &state)
+            .await?;
 
         // Stream remaining bidirectional TCP traffic
         let (mut cr, mut cw) = client_stream.into_split();
@@ -223,18 +287,13 @@ async fn handle_client(
     // 3. PLAIN HTTP FORWARD PROXY (GET / POST / etc.)
     if let Some(host_line) = request_head.lines().find(|l| l.to_ascii_lowercase().starts_with("host:")) {
         let host = host_line["host:".len()..].trim();
-        let host_clean = host.split(':').next().unwrap_or(host);
+        let (host_str, port) = if let Some((h, p)) = host.split_once(':') {
+            (h, p.parse::<u16>().unwrap_or(80))
+        } else {
+            (host, 80)
+        };
 
-        if let Some(tracker) = is_tracker(host_clean) {
-            state.trackers_blocked.fetch_add(1, Ordering::Relaxed);
-            state
-                .log_event(
-                    "TRACKER_BLOCKED",
-                    &format!("Blocked Plain HTTP Tracker: {}", tracker),
-                    &format!("Blocked plain HTTP request to {}", host_clean),
-                    host_clean,
-                )
-                .await;
+        if check_policy_block(host_str, port, "HTTP", &state).await {
             client_stream
                 .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                 .await?;
@@ -242,24 +301,29 @@ async fn handle_client(
         }
 
         state.queries_intercepted.fetch_add(1, Ordering::Relaxed);
-        decorrelator.trigger_chaff_burst("PROXY_HTTP", host_clean);
+        decorrelator.trigger_chaff_burst("PROXY_HTTP", host_str);
         state
             .log_event(
                 "PROXY_INTERCEPTED",
                 "HTTP Request Intercepted",
-                &format!("Forwarded HTTP request for {}", host_clean),
-                host_clean,
+                &format!("Forwarded HTTP request for {}", host_str),
+                host_str,
             )
             .await;
 
-        let (host_str, port) = if let Some((h, p)) = host.split_once(':') {
-            (h, p.parse::<u16>().unwrap_or(80))
-        } else {
-            (host, 80)
-        };
-
         if let Ok(mut target_stream) = connect_with_doh(host_str, port, &doh_pool, &state).await {
-            target_stream.write_all(&initial_buf[..n]).await?;
+            let payload_to_send = if state.ja3_shuffle.load(Ordering::Relaxed) {
+                if let Some(norm) = normalize_http_request_headers(&initial_buf[..n]) {
+                    state.ja3_fingerprints_shuffled.fetch_add(1, Ordering::Relaxed);
+                    norm
+                } else {
+                    initial_buf[..n].to_vec()
+                }
+            } else {
+                initial_buf[..n].to_vec()
+            };
+
+            target_stream.write_all(&payload_to_send).await?;
             let (mut cr, mut cw) = client_stream.into_split();
             let (mut tr, mut tw) = target_stream.into_split();
 
@@ -298,7 +362,26 @@ async fn handle_socks5(
     // Read SOCKS5 Request
     let mut req_buf = [0u8; 512];
     let req_len = client_stream.read(&mut req_buf).await?;
-    if req_len < 7 || req_buf[0] != 0x05 || req_buf[1] != 0x01 {
+    if req_len < 7 || req_buf[0] != 0x05 {
+        return Ok(());
+    }
+
+    // Intercept SOCKS5 UDP ASSOCIATE (0x03) used for direct WebRTC/UDP hole punching when shield is active
+    if req_buf[1] == 0x03 && state.webrtc_shield.load(Ordering::Relaxed) {
+        state.webrtc_leaks_blocked.fetch_add(1, Ordering::Relaxed);
+        state
+            .log_event(
+                "WEBRTC_BLOCKED",
+                "SOCKS5 UDP Associate Blocked",
+                "Prevented direct UDP socket binding commonly used by WebRTC STUN leak probes",
+                "0.0.0.0",
+            )
+            .await;
+        let _ = client_stream.write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+        return Ok(());
+    }
+
+    if req_buf[1] != 0x01 {
         // CMD != 0x01 (CONNECT) -> command not supported
         let _ = client_stream.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
         return Ok(());
@@ -336,17 +419,8 @@ async fn handle_socks5(
         _ => return Ok(()),
     };
 
-    // Tracker Check
-    if let Some(tracker) = is_tracker(&target_host) {
-        state.trackers_blocked.fetch_add(1, Ordering::Relaxed);
-        state
-            .log_event(
-                "TRACKER_BLOCKED",
-                &format!("SOCKS5 Blocked Tracker: {}", tracker),
-                &format!("Blocked SOCKS5 connection to {}:{}", target_host, target_port),
-                &target_host,
-            )
-            .await;
+    // Tracker & WebRTC STUN/TURN Policy Check
+    if check_policy_block(&target_host, target_port, "SOCKS5", &state).await {
         // Reply Connection not allowed by ruleset (0x02)
         let _ = client_stream.write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
         return Ok(());
@@ -377,35 +451,15 @@ async fn handle_socks5(
         )
         .await;
 
-    // Read first client packet (typically TLS ClientHello for HTTPS)
-    let mut first_packet = [0u8; 4096];
-    let bytes_read = client_stream.read(&mut first_packet).await?;
-    if bytes_read > 0 {
-        let use_sni_frag = state.sni_fragmentation.load(Ordering::Relaxed);
-        if use_sni_frag && target_port == 443 {
-            let did_frag =
-                send_fragmented_client_hello(&mut target_stream, &first_packet[..bytes_read])
-                    .await?;
-
-            if did_frag {
-                state.sni_sliced_handshakes.fetch_add(1, Ordering::Relaxed);
-                state
-                    .log_event(
-                        "SNI_FRAGMENTED",
-                        "Anti-DPI: SNI Packet Sliced",
-                        &format!(
-                            "Fragmented SOCKS5 TLS ClientHello for {} to blind ISP inspection",
-                            target_host
-                        ),
-                        &target_host,
-                    )
-                    .await;
-            }
-        } else {
-            target_stream.write_all(&first_packet[..bytes_read]).await?;
-            target_stream.flush().await?;
-        }
-    }
+    // Forward initial TLS flight with SNI/Record obfuscation
+    forward_tls_initial_flight(
+        &mut client_stream,
+        &mut target_stream,
+        &target_host,
+        target_port,
+        &state,
+    )
+    .await?;
 
     // Bidirectional TCP forwarding
     let (mut cr, mut cw) = client_stream.into_split();

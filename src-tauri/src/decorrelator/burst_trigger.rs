@@ -61,15 +61,26 @@ impl DecorrelatorEngine {
                     ));
 
                     if let Ok(raw_query) = packet.build_bytes_vec_compressed() {
-                        // Dispatch decoy to chosen upstream DoH resolver
-                        let res = doh_pool.query_doh(&raw_query, resolver).await;
-                        if res.is_ok() {
+                        let use_odoh = state.odoh_enabled.load(Ordering::Relaxed);
+                        let ja3 = state.ja3_shuffle.load(Ordering::Relaxed);
+                        // Dispatch decoy via JA3-shuffled / ODoH smart DNS path
+                        if let Ok((_, used_odoh, route_label)) = doh_pool
+                            .query_dns_smart(&raw_query, use_odoh, ja3)
+                            .await
+                        {
                             state.chaff_queries_sent.fetch_add(1, Ordering::Relaxed);
+                            if ja3 {
+                                state.ja3_fingerprints_shuffled.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if used_odoh {
+                                state.odoh_queries_relayed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let _ = resolver; // resolver kept for fallback logging
                             state
                                 .log_event(
                                     "DNS_CHAFF",
                                     &format!("Decoy Query Interspersed (+{}ms)", delay_ms),
-                                    &format!("Sent decoy '{}' via {}", decoy_domain, resolver.name),
+                                    &format!("Sent decoy '{}' via {}", decoy_domain, route_label),
                                     decoy_domain,
                                 )
                                 .await;
@@ -80,14 +91,24 @@ impl DecorrelatorEngine {
                 // If on HeavyFog, also occasionally generate a search engine decoy GET
                 if matches!(intensity, ChaffIntensity::HeavyFog) && i == 0 {
                     let search_url = random_decoy_search_url();
-                    let client = reqwest::Client::builder()
-                        .timeout(Duration::from_secs(3))
-                        .build()
-                        .unwrap_or_default();
+                    let ja3 = state.ja3_shuffle.load(Ordering::Relaxed);
+                    let (client, ua) = if ja3 {
+                        let prof = doh_pool.fp_pool.random_profile();
+                        (prof.client.clone(), prof.user_agent)
+                    } else {
+                        (
+                            reqwest::Client::builder()
+                                .no_proxy()
+                                .timeout(Duration::from_secs(3))
+                                .build()
+                                .unwrap_or_default(),
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                        )
+                    };
 
                     let _ = client
                         .get(&search_url)
-                        .header("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                        .header("user-agent", ua)
                         .send()
                         .await;
 

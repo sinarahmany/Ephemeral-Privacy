@@ -4,24 +4,31 @@ pub mod panic;
 pub mod privacy;
 pub mod proxy;
 pub mod state;
+pub mod tray;
 
 use crate::decorrelator::DecorrelatorEngine;
 use crate::dns::doh_pool::DohPool;
 use crate::dns::DnsServer;
 use crate::panic::execute_panic_killswitch;
 use crate::privacy::{
-    get_telemetry_profiles, redact_pii, restore_pii, start_clipboard_monitor, OsTelemetryItem,
-    RedactionResult,
+    get_telemetry_profiles, probe_hardware_state, redact_pii, restore_pii, run_full_privacy_audit,
+    start_clipboard_monitor, start_hardware_sentinel, HardwareStatus, OsTelemetryItem,
+    PrivacyAuditReport, RedactionResult,
 };
-use crate::proxy::sys_proxy::{disable_system_proxy, enable_system_proxy};
+use crate::proxy::sys_proxy::{
+    disable_system_proxy, enable_system_proxy, is_system_proxy_active,
+};
 use crate::proxy::ProxyServer;
 use crate::state::{AppState, ChaffIntensity, PrivacyEvent, PrivacyMetrics};
+use crate::tray::{setup_tray, TrayController};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
+
+pub struct ManagedTray(pub Mutex<Option<TrayController>>);
 
 #[derive(Serialize, Deserialize)]
 pub struct AppConfigStatus {
@@ -31,6 +38,11 @@ pub struct AppConfigStatus {
     pub sni_fragmentation: bool,
     pub clipboard_cleaner: bool,
     pub pii_redactor: bool,
+    pub odoh_enabled: bool,
+    pub webrtc_shield: bool,
+    pub ja3_shuffle: bool,
+    pub hardware_sentinel_enabled: bool,
+    pub minimize_to_tray: bool,
     pub chaff_intensity: String,
     pub upstream_resolver: String,
     pub os_proxy_active: bool,
@@ -44,7 +56,9 @@ async fn get_privacy_status(state: State<'_, Arc<AppState>>) -> Result<AppConfig
         ChaffIntensity::HeavyFog => "HeavyFog",
     };
     let resolver_str = state.upstream_resolver.read().await.clone();
-    let os_proxy_active = sysproxy::Sysproxy::get_system_proxy().map(|p| p.enable).unwrap_or(false);
+    let os_proxy_active = tokio::task::spawn_blocking(|| is_system_proxy_active(1080))
+        .await
+        .unwrap_or(false);
 
     Ok(AppConfigStatus {
         proxy_enabled: state.proxy_enabled.load(Ordering::Relaxed),
@@ -53,6 +67,11 @@ async fn get_privacy_status(state: State<'_, Arc<AppState>>) -> Result<AppConfig
         sni_fragmentation: state.sni_fragmentation.load(Ordering::Relaxed),
         clipboard_cleaner: state.clipboard_cleaner.load(Ordering::Relaxed),
         pii_redactor: state.pii_redactor.load(Ordering::Relaxed),
+        odoh_enabled: state.odoh_enabled.load(Ordering::Relaxed),
+        webrtc_shield: state.webrtc_shield.load(Ordering::Relaxed),
+        ja3_shuffle: state.ja3_shuffle.load(Ordering::Relaxed),
+        hardware_sentinel_enabled: state.hardware_sentinel_enabled.load(Ordering::Relaxed),
+        minimize_to_tray: state.minimize_to_tray.load(Ordering::Relaxed),
         chaff_intensity: intensity_str.to_string(),
         upstream_resolver: resolver_str,
         os_proxy_active,
@@ -75,6 +94,7 @@ async fn toggle_feature(
     feature: String,
     enabled: bool,
     state: State<'_, Arc<AppState>>,
+    tray: State<'_, Arc<ManagedTray>>,
 ) -> Result<(), String> {
     match feature.as_str() {
         "proxy" => {
@@ -90,7 +110,20 @@ async fn toggle_feature(
         "sni" => state.sni_fragmentation.store(enabled, Ordering::Relaxed),
         "clipboard" => state.clipboard_cleaner.store(enabled, Ordering::Relaxed),
         "pii" => state.pii_redactor.store(enabled, Ordering::Relaxed),
+        "odoh" => state.odoh_enabled.store(enabled, Ordering::Relaxed),
+        "webrtc" => state.webrtc_shield.store(enabled, Ordering::Relaxed),
+        "ja3" => state.ja3_shuffle.store(enabled, Ordering::Relaxed),
+        "sentinel" => state
+            .hardware_sentinel_enabled
+            .store(enabled, Ordering::Relaxed),
+        "minimize_to_tray" => state.minimize_to_tray.store(enabled, Ordering::Relaxed),
         _ => return Err(format!("Unknown feature: {}", feature)),
+    }
+
+    if let Ok(guard) = tray.0.lock() {
+        if let Some(ref ctrl) = *guard {
+            ctrl.sync_with_state(&state);
+        }
     }
 
     state
@@ -194,6 +227,21 @@ fn get_os_telemetry_list() -> Vec<OsTelemetryItem> {
     get_telemetry_profiles()
 }
 
+#[tauri::command]
+async fn run_privacy_audit(
+    state: State<'_, Arc<AppState>>,
+    doh_pool: State<'_, DohPool>,
+) -> Result<PrivacyAuditReport, String> {
+    Ok(run_full_privacy_audit(state.inner().clone(), doh_pool.inner().clone()).await)
+}
+
+#[tauri::command]
+async fn get_hardware_status() -> Result<HardwareStatus, String> {
+    tokio::task::spawn_blocking(probe_hardware_state)
+        .await
+        .map_err(|e| format!("Hardware probe failed: {}", e))
+}
+
 extern "C" fn atexit_cleanup() {
     let _ = disable_system_proxy();
 }
@@ -214,19 +262,31 @@ pub fn run() {
     let app_state = Arc::new(AppState::new());
     let doh_pool = DohPool::new();
     let decorrelator = Arc::new(DecorrelatorEngine::new(app_state.clone(), doh_pool.clone()));
+    let managed_tray = Arc::new(ManagedTray(Mutex::new(None)));
 
     let state_for_setup = app_state.clone();
     let decorrelator_for_setup = decorrelator.clone();
+    let doh_pool_for_manage = doh_pool.clone();
+    let tray_for_setup = managed_tray.clone();
+    let state_for_window = app_state.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(state_for_setup)
         .manage(decorrelator_for_setup)
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
-                println!("[SHUTDOWN] Window close requested, restoring direct connection...");
-                let _ = disable_system_proxy();
-                window.app_handle().exit(0);
+        .manage(doh_pool_for_manage)
+        .manage(managed_tray)
+        .on_window_event(move |window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if state_for_window.minimize_to_tray.load(Ordering::Relaxed) {
+                    println!("[TRAY] Window close requested — hiding dashboard to menu bar tray (protection remains active).");
+                    api.prevent_close();
+                    let _ = window.hide();
+                } else {
+                    println!("[SHUTDOWN] Window close requested, restoring direct connection...");
+                    let _ = disable_system_proxy();
+                    window.app_handle().exit(0);
+                }
             }
             if let tauri::WindowEvent::Destroyed = event {
                 let _ = disable_system_proxy();
@@ -244,9 +304,23 @@ pub fn run() {
             sanitize_url_input,
             redact_pii_prompt,
             restore_pii_prompt,
-            get_os_telemetry_list
+            get_os_telemetry_list,
+            run_privacy_audit,
+            get_hardware_status
         ])
-        .setup(move |_app| {
+        .setup(move |app| {
+            // Initialize Menu Bar / System Tray Companion
+            match setup_tray(app.handle(), app_state.clone(), decorrelator.clone()) {
+                Ok(ctrl) => {
+                    if let Ok(mut guard) = tray_for_setup.0.lock() {
+                        *guard = Some(ctrl);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Warning: could not initialize tray icon: {}", e);
+                }
+            }
+
             let dns_server = DnsServer::new(
                 app_state.clone(),
                 doh_pool.clone(),
@@ -285,6 +359,9 @@ pub fn run() {
             // Start background clipboard monitor (uses thread::spawn internally)
             start_clipboard_monitor(app_state.clone());
 
+            // Start Hardware Snooping Sentinel (Camera & Microphone watchdog)
+            start_hardware_sentinel(app_state.clone());
+
             // Log startup
             let state_clone = app_state.clone();
             tauri::async_runtime::spawn(async move {
@@ -292,46 +369,68 @@ pub fn run() {
                     .log_event(
                         "SYSTEM_STARTUP",
                         "Ephemeral Privacy Suite Initialized",
-                        "SOCKS5 & HTTP Proxy active on :1080, DNS on :5300. Auto-configured OS routing.",
+                        "Proxy :1080, ODoH Relay DNS :5300, WebRTC Shield & Hardware Watchdog active.",
                         "127.0.0.1",
                     )
                     .await;
             });
 
-            // Register graceful termination cleanup to ensure proxy is reset on exit
-            tauri::async_runtime::spawn(async {
+            // Register graceful termination cleanup to ensure proxy is reset and process exits cleanly on signals
+            let sig_int_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
                 if tokio::signal::ctrl_c().await.is_ok() {
                     let _ = disable_system_proxy();
+                    sig_int_app.exit(0);
                 }
             });
 
             #[cfg(unix)]
-            tauri::async_runtime::spawn(async {
-                use tokio::signal::unix::{signal, SignalKind};
-                if let Ok(mut term) = signal(SignalKind::terminate()) {
-                    term.recv().await;
-                    let _ = disable_system_proxy();
-                }
-            });
+            {
+                let sig_term_app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    if let Ok(mut term) = signal(SignalKind::terminate()) {
+                        term.recv().await;
+                        let _ = disable_system_proxy();
+                        sig_term_app.exit(0);
+                    }
+                });
 
-            #[cfg(unix)]
-            tauri::async_runtime::spawn(async {
-                use tokio::signal::unix::{signal, SignalKind};
-                if let Ok(mut hup) = signal(SignalKind::hangup()) {
-                    hup.recv().await;
-                    let _ = disable_system_proxy();
-                }
-            });
+                let sig_hup_app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    if let Ok(mut hup) = signal(SignalKind::hangup()) {
+                        hup.recv().await;
+                        let _ = disable_system_proxy();
+                        sig_hup_app.exit(0);
+                    }
+                });
+            }
 
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app_handle, event| match event {
+        .run(|app_handle, event| match event {
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } => {
+                if !has_visible_windows {
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.unminimize();
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
                 let _ = disable_system_proxy();
                 println!("[SYSTEM] Reset OS proxy to direct connection on exit.");
             }
-            _ => {}
+            _ => {
+                let _ = app_handle;
+            }
         });
 }

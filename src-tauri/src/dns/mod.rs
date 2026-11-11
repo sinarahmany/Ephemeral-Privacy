@@ -1,11 +1,13 @@
 pub mod cname;
 pub mod doh_pool;
+pub mod odoh;
 pub mod sinkhole;
 
 use crate::decorrelator::DecorrelatorEngine;
 use crate::dns::cname::{build_sinkhole_response, inspect_cname_response};
 use crate::dns::doh_pool::DohPool;
 use crate::dns::sinkhole::is_tracker;
+use crate::proxy::webrtc_shield::is_webrtc_stun_target;
 use crate::state::AppState;
 use simple_dns::Packet;
 use std::net::SocketAddr;
@@ -104,7 +106,27 @@ async fn handle_dns_query(
     let domain = question.qname.to_string();
     let clean_domain = domain.trim_end_matches('.');
 
-    // 1. Direct Sinkhole Tracker Check
+    // 1. WebRTC STUN/TURN Leak Shield Check
+    if state.webrtc_shield.load(Ordering::Relaxed) {
+        if let Some(reason) = is_webrtc_stun_target(clean_domain, None) {
+            state.webrtc_leaks_blocked.fetch_add(1, Ordering::Relaxed);
+            state
+                .log_event(
+                    "WEBRTC_BLOCKED",
+                    "WebRTC IP Leak Blocked (DNS)",
+                    &format!("Blocked {} ({}) to prevent LAN/WAN IP exposure", clean_domain, reason),
+                    clean_domain,
+                )
+                .await;
+
+            if let Some(sinkhole_resp) = build_sinkhole_response(&query_bytes) {
+                let _ = socket.send_to(&sinkhole_resp, client_addr).await;
+            }
+            return;
+        }
+    }
+
+    // 2. Direct Sinkhole Tracker Check
     if let Some(tracker_name) = is_tracker(clean_domain) {
         state.trackers_blocked.fetch_add(1, Ordering::Relaxed);
         state
@@ -122,15 +144,24 @@ async fn handle_dns_query(
         return;
     }
 
-    // 2. Legitimate query: Record metrics and trigger Ephemeral Chaff Decoy burst!
+    // 3. Legitimate query: Record metrics and trigger Ephemeral Chaff Decoy burst!
     state.queries_intercepted.fetch_add(1, Ordering::Relaxed);
     decorrelator.trigger_chaff_burst("DNS", clean_domain);
 
-    // 3. Forward to Upstream Encrypted DoH Resolver
-    let resolver = doh_pool.next_resolver();
-    match doh_pool.query_doh(&query_bytes, resolver).await {
-        Ok(resp_bytes) => {
-            // 4. Inspect response for CNAME Cloaking
+    let use_odoh = state.odoh_enabled.load(Ordering::Relaxed);
+    let ja3_shuffle = state.ja3_shuffle.load(Ordering::Relaxed);
+
+    // 4. Forward via ODoH Relay (when enabled) or Encrypted DoH Pool
+    match doh_pool.query_dns_smart(&query_bytes, use_odoh, ja3_shuffle).await {
+        Ok((resp_bytes, used_odoh, route_name)) => {
+            if used_odoh {
+                state.odoh_queries_relayed.fetch_add(1, Ordering::Relaxed);
+            }
+            if ja3_shuffle {
+                state.ja3_fingerprints_shuffled.fetch_add(1, Ordering::Relaxed);
+            }
+
+            // 5. Inspect response for CNAME Cloaking
             if let Some(cname_res) = inspect_cname_response(&resp_bytes) {
                 if cname_res.is_cloaked_tracker {
                     state.trackers_blocked.fetch_add(1, Ordering::Relaxed);
@@ -155,11 +186,12 @@ async fn handle_dns_query(
                 }
             }
 
+            let _ = route_name;
             // Normal legitimate response
             let _ = socket.send_to(&resp_bytes, client_addr).await;
         }
         Err(e) => {
-            eprintln!("DoH resolution failed for {}: {}", clean_domain, e);
+            eprintln!("DoH/ODoH resolution failed for {}: {}", clean_domain, e);
         }
     }
 }
