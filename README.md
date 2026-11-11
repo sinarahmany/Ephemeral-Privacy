@@ -1,8 +1,8 @@
 # Ephemeral Privacy Suite
 
-Trying to check the weather or look up a quick question online shouldn't wake up 40 ad brokers, analytics scripts disguised as first-party subdomains, passive browser fingerprinting, and an ISP logging every domain you visit. Between intrusive ads, silent CNAME tracking, and apps quietly phoning home all day, normal browsing feels way more exposed than it needs to be.
+Honestly, just trying to use the internet right now is exhausting. You open one page to check the weather and 40 ad trackers fire behind your back, analytics scripts hide under the site's own subdomain to dodge basic blockers, sites fingerprint your browser, and your ISP gets a neat little log of every domain you looked at. Everything feels like it's quietly watching you.
 
-**Ephemeral Privacy Suite** is a fast, RAM-only macOS privacy proxy and local shield built with **Rust**, **Tauri v2**, and **Svelte 5** to push back without breaking your connection or writing history to disk. It routes browser and proxy-aware traffic locally (`127.0.0.1:1080` + UDP `:5300`), drops ads and CNAME-cloaked trackers before they connect, separates your IP from your DNS lookups with **Oblivious DoH (RFC 9230)** relays, fragments TLS `ClientHello` headers against single-packet ISP sniffers, sprinkles in fake decoy traffic, watches camera and mic hardware silently, and — critically — cleans up macOS Wi-Fi proxy settings when you quit so it never strands your internet.
+So I built **Ephemeral Privacy Suite** — a lightweight macOS privacy shield (Rust, Tauri v2, and Svelte 5) that runs locally on your Mac (`127.0.0.1:1080` + DNS `:5300`) and pushes back without logging anything to disk. It drops ads and sneaky CNAME trackers before they even connect, hides DNS lookups behind double-blind Oblivious DoH relays so no single server sees both your IP and the domain, splits up TLS handshakes so simple ISP sniffers can't read what you're opening, mixes in decoy traffic noise, keeps a silent eye on your mic and camera, and actually restores your Wi-Fi settings when you close it instead of killing your internet.
 
 ![Ephemeral Privacy Overview](docs/screenshots/overview.png)
 
