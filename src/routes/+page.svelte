@@ -3,45 +3,37 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import {
-    Shield,
-    ShieldAlert,
-    ShieldCheck,
     Activity,
-    Flame,
-    EyeOff,
-    Radio,
-    Lock,
-    RefreshCw,
-    Sliders,
-    Terminal,
     AlertTriangle,
-    Copy,
+    Camera,
+    Check,
     CheckCircle,
-    Zap,
-    ExternalLink,
-    Filter,
-    Layers,
-    Send,
-    Info,
     ChevronDown,
     ChevronUp,
-    Camera,
-    Mic,
-    Shuffle,
-    Globe,
-    Play,
     Clock,
-    AppWindow
+    Copy,
+    Filter,
+    Info,
+    Lock,
+    Mic,
+    Play,
+    Radio,
+    RefreshCw,
+    ShieldAlert,
+    ShieldCheck,
+    Sliders,
+    Zap
   } from "@lucide/svelte";
 
-  // Navigation tab state
-  let activeTab = $state<"dashboard" | "audit" | "modules" | "ai_sandbox" | "url_cleaner" | "os_telemetry">("dashboard");
+  type NavSection = "overview" | "protections" | "audit" | "tools";
+  type EventFilter = "all" | "alerts" | "network";
 
-  // First-time user guide toggle
-  let showFirstTimeGuide = $state(true);
-
-  // Active info tooltip popup
-  let activeInfoModal = $state<string | null>(null);
+  let activeSection = $state<NavSection>("overview");
+  let eventFilter = $state<EventFilter>("all");
+  let showQuickGuide = $state(false);
+  let activeGlossary = $state<string | null>(null);
+  let showTelemetryList = $state(false);
+  let showVaultMap = $state(false);
 
   let status = $state({
     proxy_enabled: true,
@@ -102,16 +94,28 @@
     checks: AuditCheckResult[];
   }
 
+  interface OsItem {
+    id: string;
+    name: string;
+    os: string;
+    description: string;
+    risk_level: string;
+  }
+
   let recentEvents = $state<PrivacyEvent[]>([]);
+  let telemetryList = $state<OsItem[]>([]);
+  let auditReport = $state<PrivacyAuditReport | null>(null);
+
+  let isAuditRunning = $state(false);
+  let expandedAuditProofs = $state<Record<string, boolean>>({});
+  let decoySentFeedback = $state(false);
+
+  // Two-step inline emergency disconnect state (avoids disruptive modal confirm)
+  let panicArmed = $state(false);
   let isPanicLoading = $state(false);
   let panicMessage = $state("");
 
-  // Privacy Audit & Leak Test states
-  let auditReport = $state<PrivacyAuditReport | null>(null);
-  let isAuditRunning = $state(false);
-  let expandedAuditProofs = $state<Record<string, boolean>>({});
-
-  // AI Sandbox states
+  // Privacy Tools states
   let sandboxInput = $state(
     "Please review this code for user alex.morgan@fintech.io. Authorization: Bearer sk-ant-api03-9999888877776666555544443333222211110000. Customer card on file is 4532 0151 1283 0366."
   );
@@ -121,22 +125,55 @@
     token_map: Record<string, string>;
   } | null>(null);
   let sandboxRestored = $state("");
+  let copiedMasked = $state(false);
 
-  // URL Cleaner test state
   let testUrlInput = $state(
     "https://store.example.com/item/4829?utm_source=facebook&utm_medium=cpc&utm_campaign=winter_sale&fbclid=IwAR29184712048124&gclid=Cj0KCQjwgJ8&ref_src=twsrc"
   );
   let testUrlCleaned = $state<string | null>(null);
+  let copiedUrl = $state(false);
 
-  // OS Telemetry items
-  interface OsItem {
-    id: string;
-    name: string;
-    os: string;
-    description: string;
-    risk_level: string;
+  let filteredEvents = $derived.by(() => {
+    if (eventFilter === "alerts") {
+      return recentEvents.filter((ev) =>
+        ["TRACKER_BLOCKED", "WEBRTC_BLOCKED", "HARDWARE_ALERT", "PANIC_TRIGGERED"].includes(ev.category)
+      );
+    }
+    if (eventFilter === "network") {
+      return recentEvents.filter((ev) =>
+        ["ODOH_RESOLVED", "DOH_RESOLVED", "SNI_FRAGMENTED", "DNS_CHAFF", "SEARCH_CHAFF"].includes(ev.category)
+      );
+    }
+    return recentEvents;
+  });
+
+  function formatCategoryBadge(category: string): { label: string; tone: string } {
+    switch (category) {
+      case "TRACKER_BLOCKED":
+        return { label: "Blocked", tone: "bg-amber-500/10 text-amber-300 border-amber-500/25" };
+      case "WEBRTC_BLOCKED":
+        return { label: "IP Leak Stopped", tone: "bg-rose-500/15 text-rose-300 border-rose-500/30" };
+      case "HARDWARE_ALERT":
+        return { label: "Sensor Alert", tone: "bg-rose-500/20 text-rose-200 border-rose-500/40" };
+      case "HARDWARE_CLEAR":
+        return { label: "Sensor Idle", tone: "bg-emerald-500/10 text-emerald-300 border-emerald-500/25" };
+      case "ODOH_RESOLVED":
+        return { label: "Double-Blind DNS", tone: "bg-emerald-500/10 text-emerald-300 border-emerald-500/25" };
+      case "DOH_RESOLVED":
+        return { label: "Encrypted DNS", tone: "bg-cyan-500/10 text-cyan-300 border-cyan-500/25" };
+      case "SNI_FRAGMENTED":
+        return { label: "ISP Blinded", tone: "bg-emerald-500/10 text-emerald-300 border-emerald-500/25" };
+      case "DNS_CHAFF":
+      case "SEARCH_CHAFF":
+        return { label: "Decoy Noise", tone: "bg-cyan-500/10 text-cyan-300 border-cyan-500/25" };
+      case "URL_SANITIZED":
+        return { label: "Link Cleaned", tone: "bg-emerald-500/10 text-emerald-300 border-emerald-500/25" };
+      case "PRIVACY_AUDIT":
+        return { label: "Security Check", tone: "bg-cyan-500/10 text-cyan-300 border-cyan-500/25" };
+      default:
+        return { label: "System", tone: "bg-white/[0.05] text-zinc-300 border-white/10" };
+    }
   }
-  let telemetryList = $state<OsItem[]>([]);
 
   async function fetchStatus() {
     try {
@@ -161,8 +198,8 @@
     }
   }
 
-  function openAuditTab() {
-    activeTab = "audit";
+  function openAuditSection() {
+    activeSection = "audit";
     if (!auditReport && !isAuditRunning) {
       runPrivacyAudit();
     }
@@ -196,6 +233,10 @@
   async function triggerManualBurst() {
     try {
       await invoke("trigger_manual_chaff_burst");
+      decoySentFeedback = true;
+      setTimeout(() => {
+        decoySentFeedback = false;
+      }, 2000);
       await fetchStatus();
     } catch (e) {
       console.error("Manual burst error:", e);
@@ -211,16 +252,21 @@
     }
   }
 
-  async function handlePanic() {
-    if (!confirm("EMERGENCY RESET: Restore direct network connection, flush system DNS cache, and purge clipboard?")) {
-      return;
-    }
+  function armPanic() {
+    panicArmed = true;
+    setTimeout(() => {
+      panicArmed = false;
+    }, 5000);
+  }
+
+  async function confirmPanic() {
+    panicArmed = false;
     isPanicLoading = true;
     try {
       panicMessage = await invoke("trigger_panic");
       await fetchStatus();
     } catch (e) {
-      panicMessage = `Panic failed: ${e}`;
+      panicMessage = `Reset failed: ${e}`;
     } finally {
       isPanicLoading = false;
       setTimeout(() => {
@@ -258,6 +304,21 @@
     }
   }
 
+  async function copyText(text: string, which: "masked" | "url") {
+    try {
+      await navigator.clipboard.writeText(text);
+      if (which === "masked") {
+        copiedMasked = true;
+        setTimeout(() => (copiedMasked = false), 1800);
+      } else {
+        copiedUrl = true;
+        setTimeout(() => (copiedUrl = false), 1800);
+      }
+    } catch (e) {
+      console.error("Clipboard write error:", e);
+    }
+  }
+
   async function loadTelemetry() {
     try {
       telemetryList = await invoke("get_os_telemetry_list");
@@ -279,7 +340,6 @@
       unlisten = fn;
     });
 
-    // Auto-refresh metrics every 1.5 seconds
     const interval = setInterval(fetchStatus, 1500);
     return () => {
       clearInterval(interval);
@@ -288,1066 +348,879 @@
   });
 </script>
 
-<div class="h-screen w-screen flex flex-col bg-[#0b0f19] text-slate-100 antialiased overflow-hidden select-none">
-  <!-- TOP APP HEADER -->
-  <header class="h-16 border-b border-slate-800/80 bg-slate-950/70 px-6 flex items-center justify-between shrink-0 backdrop-blur-md">
-    <div class="flex items-center gap-3">
-      <div class="h-10 w-10 rounded-xl bg-gradient-to-br from-indigo-500 to-cyan-500 flex items-center justify-center shadow-lg shadow-indigo-500/20 ring-1 ring-white/20">
-        <ShieldCheck class="w-6 h-6 text-white" />
-      </div>
-      <div>
-        <div class="flex items-center gap-2">
-          <span class="font-bold tracking-wider text-sm text-slate-100">EPHEMERAL</span>
-          <span class="text-xs px-1.5 py-0.5 rounded font-mono font-semibold bg-cyan-950 text-cyan-400 border border-cyan-800/50">PRIVACY SUITE</span>
+<!-- APP SHELL: STEALTH SIDEBAR + BREATHABLE WORKSPACE -->
+<div class="h-screen w-screen flex bg-[#050709] text-zinc-100 antialiased overflow-hidden">
+  <!-- LEFT NAVIGATION RAIL -->
+  <aside class="w-56 shrink-0 bg-[#080b0f] border-r border-white/[0.07] flex flex-col justify-between p-4">
+    <div class="space-y-6">
+      <!-- Brand Lockup -->
+      <div class="flex items-center gap-3 px-1">
+        <div class="w-9 h-9 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center shrink-0">
+          <ShieldCheck class="w-5 h-5 text-emerald-400" />
         </div>
-        <div class="text-[11px] text-slate-400 flex items-center gap-2 mt-0.5 flex-wrap">
-          <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-          <span>Shields Active</span>
-          <span class="text-slate-600">•</span>
-          <span class="font-mono text-slate-300">Proxy :1080</span>
-          <span class="text-slate-600">•</span>
-          <span class="font-mono text-cyan-400">
-            {status.odoh_enabled ? "Oblivious DoH Relay" : "Encrypted DoH"}
-          </span>
-          <span class="text-slate-600">•</span>
-          {#if metrics.camera_active || metrics.mic_active}
-            <span class="px-2 py-0.5 rounded bg-rose-950/90 border border-rose-500/80 text-[10px] text-rose-200 font-semibold flex items-center gap-1 animate-pulse">
-              {#if metrics.camera_active}<Camera class="w-3 h-3 text-rose-400" /> CAM{/if}
-              {#if metrics.mic_active}<Mic class="w-3 h-3 text-rose-400" /> MIC{/if}
-              LIVE
+        <div class="min-w-0">
+          <div class="text-sm font-semibold tracking-tight text-zinc-100 leading-none">Ephemeral</div>
+          <div class="flex items-center gap-1.5 mt-1.5">
+            <span class="w-1.5 h-1.5 rounded-full {status.os_proxy_active && status.proxy_enabled ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}"></span>
+            <span class="text-[11px] font-medium {status.os_proxy_active && status.proxy_enabled ? 'text-emerald-400' : 'text-amber-300'}">
+              {status.os_proxy_active && status.proxy_enabled ? "Shield Active" : "Shield Paused"}
             </span>
-          {:else}
-            <span class="px-2 py-0.5 rounded bg-emerald-950/70 border border-emerald-800/60 text-[10px] text-emerald-300 font-medium flex items-center gap-1">
-              <Camera class="w-3 h-3 opacity-70" />
-              <Mic class="w-3 h-3 opacity-70" />
-              {status.hardware_sentinel_enabled ? "Sensors Idle" : "Sensors Off"}
-            </span>
-          {/if}
+          </div>
+        </div>
+      </div>
 
-          {#if !status.os_proxy_active}
-            <button
-              onclick={handleReassertProxy}
-              class="ml-1 px-2 py-0.5 rounded bg-amber-950/80 hover:bg-amber-900 border border-amber-600/80 text-[10px] text-amber-300 font-semibold flex items-center gap-1 transition-colors animate-pulse"
-              title="Click to re-route your browser & OS traffic through the privacy proxy"
-            >
-              <AlertTriangle class="w-3 h-3 text-amber-400" />
-              OS Proxy Inactive (Click to Re-enable)
-            </button>
+      <!-- Primary Navigation -->
+      <nav class="space-y-1" aria-label="Main sections">
+        <button
+          onclick={() => (activeSection = "overview")}
+          class="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-colors {activeSection === 'overview' ? 'bg-white/[0.07] text-zinc-100 border border-white/[0.08]' : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.03] border border-transparent'}"
+        >
+          <Activity class="w-4 h-4 {activeSection === 'overview' ? 'text-emerald-400' : 'text-zinc-500'}" />
+          <span>Overview</span>
+        </button>
+
+        <button
+          onclick={() => (activeSection = "protections")}
+          class="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-colors {activeSection === 'protections' ? 'bg-white/[0.07] text-zinc-100 border border-white/[0.08]' : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.03] border border-transparent'}"
+        >
+          <Sliders class="w-4 h-4 {activeSection === 'protections' ? 'text-emerald-400' : 'text-zinc-500'}" />
+          <span>Protections</span>
+        </button>
+
+        <button
+          onclick={openAuditSection}
+          class="w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-[13px] font-medium transition-colors {activeSection === 'audit' ? 'bg-white/[0.07] text-zinc-100 border border-white/[0.08]' : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.03] border border-transparent'}"
+        >
+          <span class="flex items-center gap-2.5">
+            <Lock class="w-4 h-4 {activeSection === 'audit' ? 'text-emerald-400' : 'text-zinc-500'}" />
+            <span>Security Check</span>
+          </span>
+          {#if auditReport}
+            <span class="text-[11px] font-mono tabular-nums px-1.5 py-0.5 rounded {auditReport.score >= 85 ? 'text-emerald-300 bg-emerald-500/10' : 'text-amber-300 bg-amber-500/10'}">
+              {auditReport.score}
+            </span>
           {/if}
-        </div>
-      </div>
+        </button>
+
+        <button
+          onclick={() => (activeSection = "tools")}
+          class="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-colors {activeSection === 'tools' ? 'bg-white/[0.07] text-zinc-100 border border-white/[0.08]' : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.03] border border-transparent'}"
+        >
+          <Filter class="w-4 h-4 {activeSection === 'tools' ? 'text-emerald-400' : 'text-zinc-500'}" />
+          <span>Privacy Tools</span>
+        </button>
+      </nav>
     </div>
 
-    <!-- Quick Action Controls -->
-    <div class="flex items-center gap-3">
-      {#if panicMessage}
-        <span class="text-xs font-mono text-emerald-400 bg-emerald-950/80 border border-emerald-800 px-3 py-1 rounded-lg">
-          {panicMessage}
+    <!-- Bottom Controls & Hardware Status -->
+    <div class="space-y-3 pt-4 border-t border-white/[0.07]">
+      <!-- Hardware Sensor Watchdog Pill -->
+      <div class="px-3 py-2 rounded-lg border text-xs flex items-center justify-between {metrics.camera_active || metrics.mic_active ? 'bg-rose-950/60 border-rose-500/50 text-rose-200 animate-pulse' : 'bg-[#0b0f14] border-white/[0.06] text-zinc-400'}">
+        <span class="flex items-center gap-1.5 truncate">
+          <Camera class="w-3.5 h-3.5 {metrics.camera_active ? 'text-rose-400' : 'text-zinc-500'}" />
+          <Mic class="w-3.5 h-3.5 {metrics.mic_active ? 'text-rose-400' : 'text-zinc-500'}" />
+          <span class="truncate">
+            {#if metrics.camera_active || metrics.mic_active}
+              {metrics.camera_active && metrics.mic_active ? "Cam & Mic On" : metrics.camera_active ? "Camera On" : "Mic On"}
+            {:else}
+              {status.hardware_sentinel_enabled ? "Sensors Idle" : "Watchdog Off"}
+            {/if}
+          </span>
         </span>
-      {/if}
+      </div>
 
+      <!-- Decoy Noise Action -->
       <button
         onclick={triggerManualBurst}
-        class="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-cyan-950/80 hover:bg-cyan-900 border border-cyan-700/80 text-xs font-medium text-cyan-300 transition-all shadow-sm hover:scale-[1.02] active:scale-[0.98]"
-        title="Fire an instant burst of realistic camouflage queries across ODoH relays, Quad9, Mullvad, and Cloudflare"
+        class="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-[#10151c] hover:bg-[#161d26] border border-white/[0.08] text-xs font-medium text-zinc-200 transition-colors"
+        title="Mix harmless background searches with your traffic to confuse ad trackers"
       >
-        <Radio class="w-3.5 h-3.5 text-cyan-400 animate-pulse" />
-        Send Decoy Burst
+        {#if decoySentFeedback}
+          <Check class="w-3.5 h-3.5 text-emerald-400" />
+          <span class="text-emerald-300">Decoys Sent</span>
+        {:else}
+          <Radio class="w-3.5 h-3.5 text-cyan-400" />
+          <span>Send Decoy Noise</span>
+        {/if}
       </button>
 
-      <button
-        onclick={handlePanic}
-        disabled={isPanicLoading}
-        class="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-red-950/80 hover:bg-red-900 border border-red-700/80 text-xs font-semibold text-red-200 transition-all shadow-lg shadow-red-950/40 hover:scale-[1.02] active:scale-[0.98]"
-        title="Emergency reset: restores direct connection, flushes system DNS, and purges clipboard"
-      >
-        <Flame class="w-3.5 h-3.5 text-red-400 animate-pulse" />
-        EMERGENCY RESET
-      </button>
-    </div>
-  </header>
-
-  <!-- HARDWARE SNOOPING SENTINEL ALERT BANNER -->
-  {#if metrics.camera_active || metrics.mic_active}
-    <div class="px-6 py-2.5 bg-gradient-to-r from-rose-950 via-red-950/90 to-rose-950 border-b border-rose-500/70 text-xs flex items-center justify-between text-rose-100 shrink-0 animate-pulse">
-      <div class="flex items-center gap-3">
-        <ShieldAlert class="w-4 h-4 text-rose-400 shrink-0" />
-        <div class="flex items-center gap-2 flex-wrap">
-          <span class="font-bold uppercase tracking-wider text-rose-200">Hardware Sensor Alert:</span>
-          {#if metrics.camera_active}
-            <span class="px-2 py-0.5 rounded bg-rose-900/90 border border-rose-500/60 font-mono text-[11px]">
-              Camera Active ({metrics.camera_apps.length ? metrics.camera_apps.join(", ") : "Unknown App"})
-            </span>
-          {/if}
-          {#if metrics.mic_active}
-            <span class="px-2 py-0.5 rounded bg-rose-900/90 border border-rose-500/60 font-mono text-[11px]">
-              Microphone Active ({metrics.mic_apps.length ? metrics.mic_apps.join(", ") : "Unknown App"})
-            </span>
-          {/if}
-          <span class="text-rose-200/90">Verify that you intentionally started this recording or call.</span>
-        </div>
-      </div>
-    </div>
-  {/if}
-
-  <!-- METRICS STRIP WITH FRIENDLY EXPLANATIONS -->
-  <div class="grid grid-cols-5 gap-3 px-6 py-3.5 bg-slate-900/40 border-b border-slate-800/60 shrink-0">
-    <!-- Metric 1: Web Requests & ODoH Relay -->
-    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-3 flex items-center justify-between shadow-sm">
-      <div class="min-w-0">
-        <div class="flex items-center gap-1">
-          <div class="text-[10px] font-medium uppercase tracking-wider text-slate-400 truncate">Web Requests</div>
+      <!-- Emergency Disconnect with clean 2-step confirmation -->
+      {#if !panicArmed}
+        <button
+          onclick={armPanic}
+          disabled={isPanicLoading}
+          class="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-rose-950/40 hover:bg-rose-950/70 border border-rose-500/30 text-xs font-medium text-rose-300 transition-colors disabled:opacity-50"
+          title="Instantly turns off system routing, clears DNS cache, and empties clipboard"
+        >
+          <Zap class="w-3.5 h-3.5 text-rose-400" />
+          <span>{isPanicLoading ? "Resetting..." : "Restore Direct Wi-Fi"}</span>
+        </button>
+      {:else}
+        <div class="grid grid-cols-2 gap-1.5">
           <button
-            type="button"
-            onclick={() => activeInfoModal = activeInfoModal === 'queries' ? null : 'queries'}
-            class="text-slate-500 hover:text-cyan-400 transition-colors shrink-0"
-            title="What is this?"
+            onclick={confirmPanic}
+            class="px-2 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-[11px] font-semibold text-white transition-colors"
           >
-            <Info class="w-3 h-3" />
+            Confirm
+          </button>
+          <button
+            onclick={() => (panicArmed = false)}
+            class="px-2 py-2 rounded-lg bg-white/[0.06] hover:bg-white/[0.1] text-[11px] font-medium text-zinc-300 transition-colors"
+          >
+            Cancel
           </button>
         </div>
-        <div class="text-xl font-bold font-mono text-slate-100 mt-0.5">{metrics.queries_intercepted}</div>
-        <div class="text-[10px] text-blue-400 font-mono truncate">{metrics.odoh_queries_relayed} via ODoH</div>
-      </div>
-      <div class="w-8 h-8 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400 shrink-0">
-        <Activity class="w-4 h-4" />
-      </div>
+      {/if}
     </div>
+  </aside>
 
-    <!-- Metric 2: Camouflage Decoys & JA3 -->
-    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-3 flex items-center justify-between shadow-sm">
-      <div class="min-w-0">
-        <div class="flex items-center gap-1">
-          <div class="text-[10px] font-medium uppercase tracking-wider text-slate-400 truncate">Decoy Camouflage</div>
-          <button
-            type="button"
-            onclick={() => activeInfoModal = activeInfoModal === 'chaff' ? null : 'chaff'}
-            class="text-slate-500 hover:text-cyan-400 transition-colors shrink-0"
-            title="What is this?"
-          >
-            <Info class="w-3 h-3" />
-          </button>
+  <!-- MAIN WORKSPACE -->
+  <div class="flex-1 flex flex-col min-w-0 cyber-grid-bg overflow-hidden">
+    <!-- CONTEXTUAL ALERT BARS (ONLY VISIBLE WHEN NEEDED) -->
+    {#if metrics.camera_active || metrics.mic_active}
+      <div class="px-7 py-2.5 bg-rose-950/80 border-b border-rose-500/40 text-xs flex items-center justify-between text-rose-100 shrink-0">
+        <div class="flex items-center gap-2.5">
+          <ShieldAlert class="w-4 h-4 text-rose-400 shrink-0" />
+          <span>
+            <strong class="font-semibold">Hardware Access Detected:</strong>
+            {#if metrics.camera_active}
+              Camera in use by <span class="font-mono text-rose-200">{metrics.camera_apps.length ? metrics.camera_apps.join(", ") : "Unknown App"}</span>
+            {/if}
+            {#if metrics.camera_active && metrics.mic_active} · {/if}
+            {#if metrics.mic_active}
+              Microphone in use by <span class="font-mono text-rose-200">{metrics.mic_apps.length ? metrics.mic_apps.join(", ") : "Unknown App"}</span>
+            {/if}
+          </span>
         </div>
-        <div class="text-xl font-bold font-mono text-cyan-400 mt-0.5">{metrics.chaff_queries_sent}</div>
-        <div class="text-[10px] text-cyan-500/80 font-mono truncate">{metrics.ja3_fingerprints_shuffled} JA3 shuffled</div>
+        <span class="text-[11px] text-rose-200/80">Make sure you opened this app</span>
       </div>
-      <div class="w-8 h-8 rounded-lg bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center text-cyan-400 shrink-0">
-        <Radio class="w-4 h-4 animate-pulse" />
-      </div>
-    </div>
+    {/if}
 
-    <!-- Metric 3: Trackers & Ads Blocked -->
-    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-3 flex items-center justify-between shadow-sm">
-      <div class="min-w-0">
-        <div class="flex items-center gap-1">
-          <div class="text-[10px] font-medium uppercase tracking-wider text-slate-400 truncate">Trackers Blocked</div>
-          <button
-            type="button"
-            onclick={() => activeInfoModal = activeInfoModal === 'trackers' ? null : 'trackers'}
-            class="text-slate-500 hover:text-amber-400 transition-colors shrink-0"
-            title="What is this?"
-          >
-            <Info class="w-3 h-3" />
-          </button>
+    {#if !status.os_proxy_active}
+      <div class="px-7 py-2.5 bg-amber-950/60 border-b border-amber-500/35 text-xs flex items-center justify-between text-amber-100 shrink-0">
+        <div class="flex items-center gap-2">
+          <AlertTriangle class="w-4 h-4 text-amber-400 shrink-0" />
+          <span>Your Mac is currently bypassing the privacy shield (direct connection active).</span>
         </div>
-        <div class="text-xl font-bold font-mono text-amber-400 mt-0.5">{metrics.trackers_blocked}</div>
-        <div class="text-[10px] text-slate-500 truncate">Ads &amp; spyware dropped</div>
+        <button
+          onclick={handleReassertProxy}
+          class="px-3 py-1 rounded-md bg-amber-500 hover:bg-amber-400 text-zinc-950 font-semibold text-[11px] transition-colors"
+        >
+          Re-enable Shield
+        </button>
       </div>
-      <div class="w-8 h-8 rounded-lg bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400 shrink-0">
-        <EyeOff class="w-4 h-4" />
-      </div>
-    </div>
+    {/if}
 
-    <!-- Metric 4: WebRTC Direct IP Leaks Stopped -->
-    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-3 flex items-center justify-between shadow-sm">
-      <div class="min-w-0">
-        <div class="flex items-center gap-1">
-          <div class="text-[10px] font-medium uppercase tracking-wider text-slate-400 truncate">WebRTC Leaks</div>
-          <button
-            type="button"
-            onclick={() => activeInfoModal = activeInfoModal === 'webrtc' ? null : 'webrtc'}
-            class="text-slate-500 hover:text-rose-400 transition-colors shrink-0"
-            title="What is this?"
-          >
-            <Info class="w-3 h-3" />
-          </button>
-        </div>
-        <div class="text-xl font-bold font-mono text-rose-400 mt-0.5">{metrics.webrtc_leaks_blocked}</div>
-        <div class="text-[10px] text-slate-500 truncate">STUN IP probes blocked</div>
+    {#if panicMessage}
+      <div class="px-7 py-2.5 bg-emerald-950/70 border-b border-emerald-500/35 text-xs flex items-center justify-between text-emerald-100 shrink-0">
+        <span class="flex items-center gap-2">
+          <CheckCircle class="w-4 h-4 text-emerald-400 shrink-0" />
+          {panicMessage}
+        </span>
+        <button onclick={() => (panicMessage = "")} class="text-emerald-300 hover:text-white text-[11px]">Dismiss</button>
       </div>
-      <div class="w-8 h-8 rounded-lg bg-rose-500/10 border border-rose-500/20 flex items-center justify-center text-rose-400 shrink-0">
-        <Globe class="w-4 h-4" />
-      </div>
-    </div>
+    {/if}
 
-    <!-- Metric 5: Anti-ISP Handshake Slices -->
-    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-3 flex items-center justify-between shadow-sm">
-      <div class="min-w-0">
-        <div class="flex items-center gap-1">
-          <div class="text-[10px] font-medium uppercase tracking-wider text-slate-400 truncate">ISP Slices &amp; HW</div>
-          <button
-            type="button"
-            onclick={() => activeInfoModal = activeInfoModal === 'sni' ? null : 'sni'}
-            class="text-slate-500 hover:text-emerald-400 transition-colors shrink-0"
-            title="What is this?"
-          >
-            <Info class="w-3 h-3" />
-          </button>
-        </div>
-        <div class="text-xl font-bold font-mono text-emerald-400 mt-0.5">{metrics.sni_sliced_handshakes}</div>
-        <div class="text-[10px] text-slate-500 truncate">{metrics.hardware_alerts_count} cam/mic alerts</div>
-      </div>
-      <div class="w-8 h-8 rounded-lg bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400 shrink-0">
-        <Lock class="w-4 h-4" />
-      </div>
-    </div>
-  </div>
-
-  <!-- EXPANDABLE EXPLANATION BANNER (If user clicked an info icon) -->
-  {#if activeInfoModal}
-    <div class="px-6 py-3 bg-slate-900/90 border-b border-cyan-800/40 text-xs flex items-center justify-between text-slate-200 shrink-0">
-      <div class="flex items-center gap-2">
-        <Info class="w-4 h-4 text-cyan-400 shrink-0" />
-        {#if activeInfoModal === 'queries'}
-          <span><strong>Web Requests &amp; ODoH Relay:</strong> Sites routed through your local proxy with RFC 9230 Oblivious DoH enabled — the Relay sees your IP (never the site name), while the DNS resolver sees the site name (never your IP).</span>
-        {:else if activeInfoModal === 'chaff'}
-          <span><strong>Decoy Camouflage &amp; JA3 Shuffling:</strong> Synthetic realistic DNS queries fired with randomized Poisson delays while rotating TLS cipher suite order and ALPN headers across outbound daemon traffic.</span>
-        {:else if activeInfoModal === 'trackers'}
-          <span><strong>Trackers &amp; Ads Blocked:</strong> Known tracking brokers, telemetry endpoints, and disguised CNAME trackers dropped before leaving your computer.</span>
-        {:else if activeInfoModal === 'webrtc'}
-          <span><strong>WebRTC IP Leak Shield:</strong> Intercepts sneaky browser/conferencing STUN &amp; TURN bypass probes (ports 3478, 5349, 19302–19309 &amp; SOCKS5 UDP) so sites cannot uncover your true home ISP IP.</span>
-        {:else if activeInfoModal === 'sni'}
-          <span><strong>ISP Snooping Blocks &amp; Hardware Alerts:</strong> Splits HTTPS ClientHello packets across TLS record boundaries to blind ISP inspection boxes, while watching Camera/Mic hardware sensors for silent capture.</span>
-        {/if}
-      </div>
-      <button onclick={() => activeInfoModal = null} class="text-xs text-slate-400 hover:text-white px-2 py-0.5">Dismiss</button>
-    </div>
-  {/if}
-
-  <!-- NAVIGATION TABS -->
-  <div class="px-6 border-b border-slate-800/80 bg-slate-950/40 flex gap-1 shrink-0 overflow-x-auto">
-    <button
-      onclick={() => (activeTab = "dashboard")}
-      class="px-3.5 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5 whitespace-nowrap {activeTab === 'dashboard' ? 'border-cyan-400 text-cyan-300' : 'border-transparent text-slate-400 hover:text-slate-200'}"
-    >
-      <Activity class="w-4 h-4" />
-      Dashboard &amp; Live Activity
-    </button>
-    <button
-      onclick={openAuditTab}
-      class="px-3.5 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5 whitespace-nowrap {activeTab === 'audit' ? 'border-emerald-400 text-emerald-300' : 'border-transparent text-slate-400 hover:text-slate-200'}"
-    >
-      <ShieldCheck class="w-4 h-4" />
-      Privacy Audit &amp; Leak Test
-    </button>
-    <button
-      onclick={() => (activeTab = "modules")}
-      class="px-3.5 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5 whitespace-nowrap {activeTab === 'modules' ? 'border-cyan-400 text-cyan-300' : 'border-transparent text-slate-400 hover:text-slate-200'}"
-    >
-      <Sliders class="w-4 h-4" />
-      Shields &amp; Anti-ISP Controls
-    </button>
-    <button
-      onclick={() => (activeTab = "ai_sandbox")}
-      class="px-3.5 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5 whitespace-nowrap {activeTab === 'ai_sandbox' ? 'border-cyan-400 text-cyan-300' : 'border-transparent text-slate-400 hover:text-slate-200'}"
-    >
-      <Lock class="w-4 h-4" />
-      AI &amp; Chat Shield
-    </button>
-    <button
-      onclick={() => (activeTab = "url_cleaner")}
-      class="px-3.5 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5 whitespace-nowrap {activeTab === 'url_cleaner' ? 'border-cyan-400 text-cyan-300' : 'border-transparent text-slate-400 hover:text-slate-200'}"
-    >
-      <Filter class="w-4 h-4" />
-      Link Stripper
-    </button>
-    <button
-      onclick={() => (activeTab = "os_telemetry")}
-      class="px-3.5 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5 whitespace-nowrap {activeTab === 'os_telemetry' ? 'border-cyan-400 text-cyan-300' : 'border-transparent text-slate-400 hover:text-slate-200'}"
-    >
-      <Layers class="w-4 h-4" />
-      OS Telemetry
-    </button>
-  </div>
-
-  <!-- MAIN TAB CONTENT -->
-  <main class="flex-1 overflow-y-auto p-6">
-    {#if activeTab === "dashboard"}
-      <div class="space-y-6">
-        <!-- FIRST-TIME USER EXPLAINER BANNER -->
-        {#if showFirstTimeGuide}
-          <div class="bg-gradient-to-r from-slate-900 via-indigo-950/40 to-slate-900 border border-indigo-800/40 rounded-2xl p-4 shadow-lg relative">
-            <div class="flex items-center justify-between mb-3">
-              <div class="flex items-center gap-2">
-                <span class="text-base">💡</span>
-                <h3 class="text-xs font-semibold text-indigo-200 uppercase tracking-wider">
-                  New to Ephemeral Privacy? Here is how your computer is protected:
-                </h3>
-              </div>
-              <button 
-                onclick={() => showFirstTimeGuide = false}
-                class="text-[11px] text-slate-400 hover:text-slate-200 transition-colors"
-              >
-                Hide Guide
-              </button>
-            </div>
-
-            <div class="grid grid-cols-4 gap-3 text-xs">
-              <div class="bg-slate-950/60 p-3 rounded-xl border border-slate-800/80">
-                <div class="font-semibold text-cyan-300 flex items-center gap-1.5 mb-1">
-                  <span>1.</span> Decoy Camouflage
+    <!-- SCROLLABLE CONTENT AREA -->
+    <main class="flex-1 overflow-y-auto px-7 py-6">
+      {#if activeSection === "overview"}
+        <div class="max-w-5xl mx-auto space-y-5">
+          <!-- HERO STATUS SURFACE -->
+          <section class="bg-[#0b0f14] border border-white/[0.07] rounded-xl p-6">
+            <div class="flex items-start justify-between gap-6">
+              <div class="space-y-2 max-w-xl">
+                <div class="flex items-center gap-2.5">
+                  <span class="w-2.5 h-2.5 rounded-full {status.os_proxy_active && status.proxy_enabled ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
+                  <h1 class="text-xl font-semibold tracking-tight text-zinc-100">
+                    {status.os_proxy_active && status.proxy_enabled ? "Your internet connection is private" : "Privacy shield is paused"}
+                  </h1>
                 </div>
-                <p class="text-slate-400 text-[11px] leading-relaxed">
-                  Every time you browse, fake realistic searches are mixed in across Quad9, Mullvad, and Cloudflare so ad networks cannot build a profile on you.
+                <p class="text-[13px] text-zinc-400 leading-relaxed">
+                  {#if status.os_proxy_active && status.proxy_enabled}
+                    Web lookups use {status.odoh_enabled ? "double-blind DNS relays" : "encrypted DNS"}, trackers and IP leak probes are blocked locally, and decoy noise keeps advertisers guessing.
+                  {:else}
+                    Automatic OS routing is paused right now. Turn on the system shield above or inside Protections to resume full protection.
+                  {/if}
                 </p>
-              </div>
 
-              <div class="bg-slate-950/60 p-3 rounded-xl border border-slate-800/80">
-                <div class="font-semibold text-emerald-300 flex items-center gap-1.5 mb-1">
-                  <span>2.</span> Anti-ISP Packet Slicing
-                </div>
-                <p class="text-slate-400 text-[11px] leading-relaxed">
-                  Your internet provider watches which websites you visit. This breaks your HTTPS packets into tiny slices so ISP inspection equipment cannot read the domain name.
-                </p>
-              </div>
-
-              <div class="bg-slate-950/60 p-3 rounded-xl border border-slate-800/80">
-                <div class="font-semibold text-amber-300 flex items-center gap-1.5 mb-1">
-                  <span>3.</span> Tracker Sinkhole
-                </div>
-                <p class="text-slate-400 text-[11px] leading-relaxed">
-                  Known telemetry endpoints, ad servers, and sneaky first-party CNAME disguised trackers are blocked before they can load.
-                </p>
-              </div>
-
-              <div class="bg-slate-950/60 p-3 rounded-xl border border-slate-800/80">
-                <div class="font-semibold text-indigo-300 flex items-center gap-1.5 mb-1">
-                  <span>4.</span> Clipboard & AI Guard
-                </div>
-                <p class="text-slate-400 text-[11px] leading-relaxed">
-                  Tracking tokens (like <code class="text-slate-300">fbclid</code> or <code class="text-slate-300">utm_*</code>) are stripped from copied links, and sensitive data is censored before pasting into AI models.
-                </p>
-              </div>
-            </div>
-          </div>
-        {/if}
-
-        <div class="grid grid-cols-12 gap-6">
-          <!-- LEFT: CAMOUFLAGE & ANTI-DPI CONTROLS -->
-          <div class="col-span-5 flex flex-col gap-6">
-            <!-- Camouflage Engine Card -->
-            <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 shadow-lg relative overflow-hidden flex flex-col justify-between">
-              <div class="flex items-center justify-between mb-4">
-                <div>
-                  <h3 class="text-sm font-semibold text-slate-200 flex items-center gap-2">
-                    <Radio class="w-4 h-4 text-cyan-400 animate-pulse" />
-                    Search & Browsing Camouflage
-                  </h3>
-                  <p class="text-xs text-slate-400 mt-0.5">Emits decoy queries to poison tracking algorithms</p>
-                </div>
-                <span class="text-[10px] font-mono px-2 py-0.5 rounded-full bg-cyan-950 text-cyan-300 border border-cyan-800/60">
-                  ACTIVE
-                </span>
-              </div>
-
-              <!-- Radar Animated Wave Canvas Simulation -->
-              <div class="h-36 rounded-xl bg-slate-950/80 border border-slate-800/80 relative flex items-center justify-center overflow-hidden">
-                <div class="absolute inset-0 bg-[radial-gradient(#06b6d4_1px,transparent_1px)] [background-size:16px_16px] opacity-20"></div>
-                
-                <!-- Expanding concentric rings -->
-                <div class="absolute w-24 h-24 rounded-full border border-cyan-500/30 animate-ping"></div>
-                <div class="absolute w-16 h-16 rounded-full border border-cyan-400/50"></div>
-                <div class="absolute w-6 h-6 rounded-full bg-cyan-400/80 shadow-lg shadow-cyan-400/50 flex items-center justify-center">
-                  <span class="w-2 h-2 rounded-full bg-white"></span>
-                </div>
-
-                <!-- Rotating scan line -->
-                <div class="absolute w-28 h-28 border-r border-cyan-400/40 rounded-full animate-spin [animation-duration:3s]"></div>
-
-                <div class="absolute bottom-2 left-3 text-[10px] font-mono text-cyan-400/80">
-                  {status.odoh_enabled ? "ODOH RELAY ↔ CLOUDFLARE / CRYPTO.SX" : "UPSTREAMS: QUAD9 ↔ MULLVAD ↔ CLOUDFLARE"}
+                <div class="pt-1 flex items-center gap-4">
+                  <button
+                    onclick={() => (showQuickGuide = !showQuickGuide)}
+                    class="text-xs font-medium text-emerald-400 hover:text-emerald-300 inline-flex items-center gap-1 transition-colors"
+                  >
+                    <Info class="w-3.5 h-3.5" />
+                    {showQuickGuide ? "Hide beginner guide" : "New to Ephemeral? See what happens behind the scenes"}
+                    {#if showQuickGuide}
+                      <ChevronUp class="w-3.5 h-3.5" />
+                    {:else}
+                      <ChevronDown class="w-3.5 h-3.5" />
+                    {/if}
+                  </button>
                 </div>
               </div>
 
-              <!-- Camouflage Density Selector -->
-              <div class="mt-4">
-                <div class="flex items-center justify-between mb-2">
-                  <span class="text-xs font-medium text-slate-300">Camouflage Density (Decoy Volume)</span>
-                  <span class="text-[10px] text-slate-500">Poisson Distribution</span>
-                </div>
-                <div class="grid grid-cols-3 gap-2">
+              <!-- Decoy Strength Switcher -->
+              <div class="shrink-0 space-y-2 text-right">
+                <div class="text-[11px] font-medium text-zinc-400">Decoy Noise Level</div>
+                <div class="inline-flex p-1 rounded-lg bg-[#050709] border border-white/[0.07]">
                   {#each [
-                    { id: "Ghost", label: "Ghost", desc: "Light Decoys" },
-                    { id: "Smokescreen", label: "Smokescreen", desc: "Balanced (Rec.)" },
-                    { id: "HeavyFog", label: "Heavy Fog", desc: "Maximum" }
-                  ] as mode}
+                    { id: "Ghost", label: "Light" },
+                    { id: "Smokescreen", label: "Balanced" },
+                    { id: "HeavyFog", label: "Heavy" }
+                  ] as level}
                     <button
-                      onclick={() => handleIntensityChange(mode.id)}
-                      class="px-2.5 py-2 rounded-xl text-xs font-medium border transition-all text-center flex flex-col items-center gap-0.5 {status.chaff_intensity === mode.id ? 'bg-cyan-500/20 border-cyan-500 text-cyan-200 shadow-md shadow-cyan-500/10' : 'bg-slate-800/40 border-slate-700/60 text-slate-400 hover:text-slate-200'}"
+                      onclick={() => handleIntensityChange(level.id)}
+                      class="px-3 py-1.5 rounded-md text-xs font-medium transition-colors {status.chaff_intensity === level.id ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30' : 'text-zinc-400 hover:text-zinc-200 border border-transparent'}"
                     >
-                      <span class="font-semibold">{mode.label}</span>
-                      <span class="text-[10px] opacity-75">{mode.desc}</span>
+                      {level.label}
                     </button>
                   {/each}
                 </div>
+                <div class="text-[11px] font-mono text-zinc-500">
+                  {status.odoh_enabled ? "Double-Blind ODoH" : "Encrypted DoH"} · Proxy :1080
+                </div>
               </div>
             </div>
 
-            <!-- Anti-DPI, ODoH, JA3 & WebRTC Stack Card -->
-            <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 shadow-lg">
-              <div class="flex items-center justify-between mb-2">
-                <h3 class="text-sm font-semibold text-slate-200 flex items-center gap-2">
-                  <Lock class="w-4 h-4 text-emerald-400" />
-                  Zero-Leak Network Transport
-                </h3>
-                <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/60 font-semibold">
-                  {status.sni_fragmentation ? "PROTECTING" : "OFF"}
+            {#if showQuickGuide}
+              <div class="mt-5 pt-4 border-t border-white/[0.07] grid grid-cols-4 gap-5 text-xs">
+                <div>
+                  <div class="font-medium text-zinc-200 mb-1">1. Hides Sites From ISP</div>
+                  <p class="text-zinc-400 leading-relaxed">Splits encrypted website names so your internet provider cannot build a browsing log.</p>
+                </div>
+                <div>
+                  <div class="font-medium text-zinc-200 mb-1">2. Confuses Ad Profilers</div>
+                  <p class="text-zinc-400 leading-relaxed">Blends harmless decoy lookups into your browsing so tracking profiles break down.</p>
+                </div>
+                <div>
+                  <div class="font-medium text-zinc-200 mb-1">3. Blocks Ads &amp; IP Leaks</div>
+                  <p class="text-zinc-400 leading-relaxed">Drops spyware domains and prevents video/chat apps from leaking your home IP.</p>
+                </div>
+                <div>
+                  <div class="font-medium text-zinc-200 mb-1">4. Guards Camera &amp; Links</div>
+                  <p class="text-zinc-400 leading-relaxed">Alerts on camera/mic activation and removes tracking tags when you copy URLs.</p>
+                </div>
+              </div>
+            {/if}
+          </section>
+
+          <!-- UNIFIED 4-COLUMN TELEMETRY STRIP -->
+          <section class="bg-[#0b0f14] border border-white/[0.07] rounded-xl overflow-hidden">
+            <div class="grid grid-cols-4 divide-x divide-white/[0.06]">
+              <div class="p-4">
+                <div class="flex items-center justify-between text-xs text-zinc-400">
+                  <span>Sites Protected</span>
+                  <button
+                    onclick={() => (activeGlossary = activeGlossary === "sites" ? null : "sites")}
+                    class="text-zinc-500 hover:text-emerald-400 transition-colors"
+                    aria-label="Explain Sites Protected"
+                  >
+                    <Info class="w-3.5 h-3.5" />
+                  </button>
+                </div>
+                <div class="text-2xl font-semibold font-mono tabular-nums text-zinc-100 mt-1.5">
+                  {metrics.queries_intercepted}
+                </div>
+                <div class="text-[11px] font-mono tabular-nums text-emerald-400/90 mt-1">
+                  {metrics.odoh_queries_relayed} double-blind lookups
+                </div>
+              </div>
+
+              <div class="p-4">
+                <div class="flex items-center justify-between text-xs text-zinc-400">
+                  <span>Ads &amp; IP Leaks Stopped</span>
+                  <button
+                    onclick={() => (activeGlossary = activeGlossary === "blocks" ? null : "blocks")}
+                    class="text-zinc-500 hover:text-amber-400 transition-colors"
+                    aria-label="Explain Ads & IP Leaks Stopped"
+                  >
+                    <Info class="w-3.5 h-3.5" />
+                  </button>
+                </div>
+                <div class="text-2xl font-semibold font-mono tabular-nums text-amber-400 mt-1.5">
+                  {metrics.trackers_blocked + metrics.webrtc_leaks_blocked}
+                </div>
+                <div class="text-[11px] font-mono tabular-nums text-zinc-400 mt-1">
+                  {metrics.trackers_blocked} trackers · {metrics.webrtc_leaks_blocked} IP leaks
+                </div>
+              </div>
+
+              <div class="p-4">
+                <div class="flex items-center justify-between text-xs text-zinc-400">
+                  <span>Decoy Noise Sent</span>
+                  <button
+                    onclick={() => (activeGlossary = activeGlossary === "decoys" ? null : "decoys")}
+                    class="text-zinc-500 hover:text-cyan-400 transition-colors"
+                    aria-label="Explain Decoy Noise Sent"
+                  >
+                    <Info class="w-3.5 h-3.5" />
+                  </button>
+                </div>
+                <div class="text-2xl font-semibold font-mono tabular-nums text-cyan-400 mt-1.5">
+                  {metrics.chaff_queries_sent}
+                </div>
+                <div class="text-[11px] font-mono tabular-nums text-zinc-400 mt-1">
+                  {metrics.ja3_fingerprints_shuffled} rotated TLS signatures
+                </div>
+              </div>
+
+              <div class="p-4">
+                <div class="flex items-center justify-between text-xs text-zinc-400">
+                  <span>ISP Snoops Blinded</span>
+                  <button
+                    onclick={() => (activeGlossary = activeGlossary === "isp" ? null : "isp")}
+                    class="text-zinc-500 hover:text-emerald-400 transition-colors"
+                    aria-label="Explain ISP Snoops Blinded"
+                  >
+                    <Info class="w-3.5 h-3.5" />
+                  </button>
+                </div>
+                <div class="text-2xl font-semibold font-mono tabular-nums text-zinc-100 mt-1.5">
+                  {metrics.sni_sliced_handshakes}
+                </div>
+                <div class="text-[11px] font-mono tabular-nums text-zinc-400 mt-1">
+                  {metrics.hardware_alerts_count} cam/mic alerts logged
+                </div>
+              </div>
+            </div>
+
+            {#if activeGlossary}
+              <div class="px-4 py-2.5 bg-[#10151c] border-t border-white/[0.06] text-xs flex items-center justify-between text-zinc-300">
+                <span>
+                  {#if activeGlossary === "sites"}
+                    Total web &amp; app connections routed through your Mac's private shield instead of going directly to your ISP's plain DNS.
+                  {:else if activeGlossary === "blocks"}
+                    Trackers dropped before loading plus WebRTC STUN/TURN leak requests stopped before websites could discover your home IP.
+                  {:else if activeGlossary === "decoys"}
+                    Fake background lookups sent with randomized timing while cycling TLS cipher profiles so advertisers see only noise.
+                  {:else if activeGlossary === "isp"}
+                    HTTPS handshakes split across multiple TLS records so ISP Deep Packet Inspection cannot read website hostnames.
+                  {/if}
                 </span>
+                <button onclick={() => (activeGlossary = null)} class="text-zinc-400 hover:text-zinc-100 ml-4 shrink-0">Close</button>
               </div>
-              <p class="text-xs text-slate-400 leading-relaxed">
-                Splits TLS ClientHello packets across record boundaries to hide visited domains, rotates JA3 cipher suite orders, relays DNS via Oblivious DoH, and drops WebRTC STUN IP-leak probes.
-              </p>
-              <div class="mt-3 space-y-1.5 text-xs">
-                <div class="flex items-center justify-between bg-slate-950/60 px-3 py-2 rounded-xl border border-slate-800/80">
-                  <span class="text-slate-300">Oblivious DoH (RFC 9230 Relay)</span>
-                  <span class="font-mono font-semibold {status.odoh_enabled ? 'text-cyan-400' : 'text-slate-500'}">{status.odoh_enabled ? "RELAYING" : "OFF"}</span>
-                </div>
-                <div class="flex items-center justify-between bg-slate-950/60 px-3 py-2 rounded-xl border border-slate-800/80">
-                  <span class="text-slate-300">WebRTC Direct IP Leak Shield</span>
-                  <span class="font-mono font-semibold {status.webrtc_shield ? 'text-rose-400' : 'text-slate-500'}">{status.webrtc_shield ? "SHIELDING" : "OFF"}</span>
-                </div>
-                <div class="flex items-center justify-between bg-slate-950/60 px-3 py-2 rounded-xl border border-slate-800/80">
-                  <span class="text-slate-300">TLS Record Split &amp; JA3 Shuffling</span>
-                  <span class="font-mono font-semibold {status.sni_fragmentation && status.ja3_shuffle ? 'text-emerald-400' : 'text-amber-400'}">{status.sni_fragmentation || status.ja3_shuffle ? "ACTIVE" : "OFF"}</span>
-                </div>
-              </div>
-            </div>
-          </div>
+            {/if}
+          </section>
 
-          <!-- RIGHT: LIVE MEMORY-ONLY PRIVACY STREAM -->
-          <div class="col-span-7 bg-slate-900/60 border border-slate-800 rounded-2xl p-5 shadow-lg flex flex-col">
-            <div class="flex items-center justify-between mb-3 shrink-0">
+          <!-- LIVE ACTIVITY STREAM (RAM-ONLY FLAT FEED) -->
+          <section class="bg-[#0b0f14] border border-white/[0.07] rounded-xl overflow-hidden">
+            <div class="px-5 py-3.5 border-b border-white/[0.06] flex items-center justify-between gap-4">
               <div>
-                <h3 class="text-sm font-semibold text-slate-200 flex items-center gap-2">
-                  <Terminal class="w-4 h-4 text-cyan-400" />
-                  Live Privacy Event Stream
-                </h3>
-                <p class="text-[11px] text-slate-400">Strictly in RAM. Zero logs written to disk.</p>
+                <h2 class="text-sm font-semibold text-zinc-100">Live Protection Feed</h2>
+                <p class="text-[11px] text-zinc-500">Kept strictly in RAM — zero history ever saved to disk.</p>
               </div>
-              <span class="text-[10px] font-mono text-slate-500">RAM RING BUFFER (50)</span>
+
+              <div class="inline-flex p-0.5 rounded-lg bg-[#050709] border border-white/[0.07] text-[11px]">
+                {#each [
+                  { id: "all", label: "All Events" },
+                  { id: "alerts", label: "Blocks & Alerts" },
+                  { id: "network", label: "Network Stealth" }
+                ] as tab}
+                  <button
+                    onclick={() => (eventFilter = tab.id as EventFilter)}
+                    class="px-2.5 py-1 rounded-md font-medium transition-colors {eventFilter === tab.id ? 'bg-white/[0.08] text-zinc-100' : 'text-zinc-400 hover:text-zinc-200'}"
+                  >
+                    {tab.label}
+                  </button>
+                {/each}
+              </div>
             </div>
 
-            <!-- Log stream list -->
-            <div class="flex-1 overflow-y-auto space-y-2 pr-1 min-h-[360px] max-h-[500px]">
-              {#if recentEvents.length === 0}
-                <div class="h-64 flex flex-col items-center justify-center text-slate-500 text-xs">
-                  <Shield class="w-8 h-8 mb-2 opacity-30" />
-                  No events recorded yet. Open any website in your browser to see live activity.
-                </div>
-              {:else}
-                {#each recentEvents as ev (ev.id)}
-                  <div class="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3 text-xs flex flex-col gap-1 transition-all hover:border-slate-700">
-                    <div class="flex items-center justify-between">
-                      <span class="font-medium text-slate-200 flex items-center gap-2">
-                        {#if ev.category === "DNS_CHAFF" || ev.category === "SEARCH_CHAFF"}
-                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-cyan-950 text-cyan-400 border border-cyan-800/50">CAMOUFLAGE</span>
-                        {:else if ev.category === "TRACKER_BLOCKED"}
-                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-amber-950 text-amber-400 border border-amber-800/50">BLOCKED</span>
-                        {:else if ev.category === "WEBRTC_BLOCKED"}
-                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-rose-950 text-rose-400 border border-rose-700/60">WEBRTC BLOCK</span>
-                        {:else if ev.category === "HARDWARE_ALERT"}
-                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-red-950 text-red-300 border border-red-600/70 animate-pulse">HW ALERT</span>
-                        {:else if ev.category === "HARDWARE_CLEAR"}
-                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-emerald-950 text-emerald-300 border border-emerald-800/50">SENSOR IDLE</span>
-                        {:else if ev.category === "ODOH_RESOLVED"}
-                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-teal-950 text-teal-300 border border-teal-700/60">ODOH RELAY</span>
-                        {:else if ev.category === "PRIVACY_AUDIT"}
-                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-violet-950 text-violet-300 border border-violet-700/60">AUDIT</span>
-                        {:else if ev.category === "SNI_FRAGMENTED"}
-                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-emerald-950 text-emerald-400 border border-emerald-800/50">ISP SLICE</span>
-                        {:else if ev.category === "DOH_RESOLVED"}
-                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-blue-950 text-blue-400 border border-blue-800/50">ENCRYPTED DOH</span>
-                        {:else if ev.category === "URL_SANITIZED"}
-                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-indigo-950 text-indigo-400 border border-indigo-800/50">CLEANED LINK</span>
-                        {:else}
-                          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-slate-800 text-slate-300">SYSTEM</span>
-                        {/if}
-                        {ev.title}
-                      </span>
-                      <span class="text-[10px] font-mono text-slate-500">{new Date(ev.timestamp * 1000).toLocaleTimeString()}</span>
+            {#if filteredEvents.length === 0}
+              <div class="py-12 px-6 text-center text-xs text-zinc-500 space-y-2">
+                <p class="text-zinc-300 font-medium">Waiting for browser or app activity</p>
+                <p>Open any website in Safari or Chrome — encrypted DNS lookups, blocked trackers, and ISP blinding will stream here live.</p>
+              </div>
+            {:else}
+              <div class="max-h-[340px] overflow-y-auto divide-y divide-white/[0.05]">
+                {#each filteredEvents as ev (ev.id)}
+                  {@const badge = formatCategoryBadge(ev.category)}
+                  <div class="px-5 py-3 hover:bg-white/[0.02] transition-colors flex items-start justify-between gap-4">
+                    <div class="min-w-0 space-y-1">
+                      <div class="flex items-center gap-2.5 flex-wrap">
+                        <span class="px-2 py-0.5 rounded border text-[10px] font-medium shrink-0 {badge.tone}">
+                          {badge.label}
+                        </span>
+                        <span class="text-xs font-medium text-zinc-200">{ev.title}</span>
+                      </div>
+                      <p class="text-[11px] text-zinc-400 leading-relaxed">{ev.details}</p>
                     </div>
-                    <div class="text-slate-400 text-[11px] leading-relaxed">{ev.details}</div>
-                    <div class="text-[10px] font-mono text-cyan-500/80 truncate">Target: {ev.target}</div>
+                    <div class="text-right shrink-0 space-y-1">
+                      <div class="text-[11px] font-mono tabular-nums text-zinc-500">
+                        {new Date(ev.timestamp * 1000).toLocaleTimeString()}
+                      </div>
+                      <div class="text-[10px] font-mono text-emerald-400/75 max-w-[190px] truncate">
+                        {ev.target}
+                      </div>
+                    </div>
                   </div>
                 {/each}
-              {/if}
-            </div>
-          </div>
-        </div>
-      </div>
-    {:else if activeTab === "audit"}
-      <!-- INTERACTIVE PRIVACY AUDIT & LEAK TEST PANEL -->
-      <div class="max-w-4xl mx-auto space-y-5">
-        <div class="bg-gradient-to-br from-slate-900 via-slate-900 to-emerald-950/30 border border-slate-800 rounded-2xl p-6 shadow-xl flex items-center justify-between gap-6">
-          <div class="flex items-center gap-5">
-            <div class="w-24 h-24 rounded-2xl bg-slate-950/90 border-2 flex flex-col items-center justify-center shrink-0 {auditReport ? (auditReport.score >= 85 ? 'border-emerald-500/80 shadow-lg shadow-emerald-500/15' : auditReport.score >= 60 ? 'border-amber-500/80' : 'border-rose-500/80') : 'border-slate-700'}">
-              <span class="text-3xl font-black font-mono {auditReport ? (auditReport.score >= 85 ? 'text-emerald-400' : auditReport.score >= 60 ? 'text-amber-400' : 'text-rose-400') : 'text-slate-500'}">
-                {auditReport ? auditReport.score : "--"}
-              </span>
-              <span class="text-[10px] font-mono uppercase tracking-wider text-slate-400">/ 100 SCORE</span>
-            </div>
-            <div>
-              <div class="flex items-center gap-2">
-                <h2 class="text-base font-bold text-slate-100">Interactive Privacy Audit &amp; Leak Test</h2>
-                {#if auditReport}
-                  <span class="text-[10px] font-mono px-2 py-0.5 rounded font-semibold {auditReport.score >= 85 ? 'bg-emerald-950 text-emerald-300 border border-emerald-700/60' : auditReport.score >= 60 ? 'bg-amber-950 text-amber-300 border border-amber-700/60' : 'bg-rose-950 text-rose-300 border border-rose-700/60'}">
-                    {auditReport.score >= 85 ? "STEALTH VERIFIED" : auditReport.score >= 60 ? "PARTIAL SHIELD" : "LEAK RISK"}
-                  </span>
-                {/if}
               </div>
-              <p class="text-xs text-slate-400 mt-1 max-w-xl leading-relaxed">
-                Runs real-time local &amp; encrypted network diagnostics against your active proxy daemon (<code class="text-slate-300">:1080</code>), RFC 9230 Oblivious DoH relays, WebRTC STUN blocking rules, TLS record slicing, and hardware camera/microphone sensors.
-              </p>
-              {#if auditReport}
-                <div class="text-[10px] font-mono text-slate-500 mt-2 flex items-center gap-2">
-                  <Clock class="w-3 h-3" />
-                  Last verified at {new Date(auditReport.timestamp * 1000).toLocaleTimeString()}
-                </div>
-              {/if}
-            </div>
-          </div>
-
-          <button
-            onclick={runPrivacyAudit}
-            disabled={isAuditRunning}
-            class="px-5 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-xs font-semibold text-white transition-all shadow-lg shadow-emerald-900/40 flex items-center gap-2 shrink-0"
-          >
-            {#if isAuditRunning}
-              <RefreshCw class="w-4 h-4 animate-spin" />
-              Running Live Probes...
-            {:else}
-              <Play class="w-4 h-4" />
-              Run Live Security Audit
             {/if}
-          </button>
+          </section>
         </div>
 
-        {#if auditReport}
-          <div class="grid grid-cols-1 gap-3">
-            {#each auditReport.checks as check (check.id)}
-              <div class="bg-slate-900/70 border rounded-2xl p-4 transition-all {check.status === 'PASS' ? 'border-emerald-900/60' : check.status === 'WARN' ? 'border-amber-800/60' : 'border-rose-800/70'}">
-                <div class="flex items-center justify-between gap-4">
-                  <div class="flex items-center gap-3">
-                    {#if check.status === "PASS"}
-                      <div class="w-8 h-8 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shrink-0">
-                        <CheckCircle class="w-4 h-4" />
-                      </div>
-                    {:else if check.status === "WARN"}
-                      <div class="w-8 h-8 rounded-lg bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400 shrink-0">
-                        <AlertTriangle class="w-4 h-4" />
-                      </div>
-                    {:else}
-                      <div class="w-8 h-8 rounded-lg bg-rose-500/10 border border-rose-500/30 flex items-center justify-center text-rose-400 shrink-0">
-                        <ShieldAlert class="w-4 h-4" />
-                      </div>
-                    {/if}
-                    <div>
-                      <div class="flex items-center gap-2">
-                        <span class="text-sm font-semibold text-slate-100">{check.name}</span>
-                        <span class="text-[10px] font-mono px-1.5 py-0.5 rounded font-semibold {check.status === 'PASS' ? 'bg-emerald-950 text-emerald-300 border border-emerald-700/50' : check.status === 'WARN' ? 'bg-amber-950 text-amber-300 border border-amber-700/50' : 'bg-rose-950 text-rose-300 border border-rose-700/50'}">
-                          {check.status}
-                        </span>
-                      </div>
-                      <p class="text-xs text-slate-400 mt-0.5">{check.summary}</p>
+      {:else if activeSection === "protections"}
+        <!-- CLEAN GROUPED PROTECTIONS -->
+        <div class="max-w-3xl mx-auto space-y-6">
+          <div>
+            <h1 class="text-lg font-semibold tracking-tight text-zinc-100">Privacy Protections</h1>
+            <p class="text-xs text-zinc-400 mt-1">Turn individual shields on or off. Recommended settings are enabled by default.</p>
+          </div>
+
+          <!-- Group 1: Browsing & Network Stealth -->
+          <div class="space-y-2">
+            <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 px-1">Browsing &amp; Network Stealth</h2>
+            <div class="bg-[#0b0f14] border border-white/[0.07] rounded-xl divide-y divide-white/[0.06]">
+              {#each [
+                {
+                  key: "odoh",
+                  on: status.odoh_enabled,
+                  title: "Hide Site Lookups (Double-Blind DNS)",
+                  tag: "RFC 9230 ODoH",
+                  desc: "Separates your IP address from the website name you look up across a relay and target so neither sees both."
+                },
+                {
+                  key: "sni",
+                  on: status.sni_fragmentation,
+                  title: "Hide Visited Websites From Your ISP",
+                  tag: "TLS Record Split",
+                  desc: "Breaks initial HTTPS website headers across tiny network frames so internet provider scanners cannot read domains."
+                },
+                {
+                  key: "dns",
+                  on: status.dns_enabled,
+                  title: "Block Ads, Trackers & Disguised Analytics",
+                  tag: "Sinkhole + CNAME",
+                  desc: "Drops connections to known ad brokers, spyware servers, and CNAME-cloaked trackers before they load."
+                },
+                {
+                  key: "chaff",
+                  on: status.chaff_enabled,
+                  title: "Confuse Profilers With Decoy Noise",
+                  tag: "Traffic Camouflage",
+                  desc: "Mixes realistic decoy lookups at random intervals with your real browsing so tracking profiles become unreliable."
+                },
+                {
+                  key: "ja3",
+                  on: status.ja3_shuffle,
+                  title: "Disguise Browser Connection Signature",
+                  tag: "JA3/JA4 Shuffling",
+                  desc: "Rotates encryption cipher suite order and headers on outbound traffic to prevent passive fingerprinting."
+                }
+              ] as item}
+                <div class="px-5 py-4 flex items-center justify-between gap-6">
+                  <div class="space-y-1 min-w-0">
+                    <div class="flex items-center gap-2">
+                      <span class="text-sm font-medium text-zinc-100">{item.title}</span>
+                      <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/[0.04] text-zinc-400 border border-white/[0.06]">{item.tag}</span>
                     </div>
+                    <p class="text-xs text-zinc-400 leading-relaxed">{item.desc}</p>
                   </div>
-
-                  <div class="flex items-center gap-3 shrink-0">
-                    <span class="text-[11px] font-mono text-slate-400">{check.latency_ms}ms</span>
-                    <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300">
-                      {check.points_earned}/{check.max_points} pts
-                    </span>
-                    <button
-                      onclick={() => toggleProof(check.id)}
-                      class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300 flex items-center gap-1 transition-colors"
-                    >
-                      Proof
-                      {#if expandedAuditProofs[check.id]}
-                        <ChevronUp class="w-3 h-3" />
-                      {:else}
-                        <ChevronDown class="w-3 h-3" />
-                      {/if}
-                    </button>
-                  </div>
-                </div>
-
-                {#if expandedAuditProofs[check.id]}
-                  <div class="mt-3 pt-3 border-t border-slate-800/80 text-[11px] font-mono text-cyan-300/90 bg-slate-950/70 rounded-xl p-3 select-all break-all">
-                    {check.proof}
-                  </div>
-                {/if}
-              </div>
-            {/each}
-          </div>
-        {:else if !isAuditRunning}
-          <div class="bg-slate-900/50 border border-slate-800 rounded-2xl p-10 text-center text-xs text-slate-400">
-            Click <strong class="text-emerald-300">Run Live Security Audit</strong> above to run live DNS, WebRTC, proxy, TLS, and hardware sensor tests.
-          </div>
-        {/if}
-      </div>
-    {:else if activeTab === "modules"}
-      <!-- PRIVACY SHIELDS & CONTROLS -->
-      <div class="max-w-4xl mx-auto space-y-4">
-        <div>
-          <h2 class="text-base font-bold text-slate-100">Privacy Shields & Anti-ISP Controls</h2>
-          <p class="text-xs text-slate-400">Toggle individual privacy layers. Every module runs entirely locally in user space without requiring root or kernel extensions.</p>
-        </div>
-
-        <div class="grid grid-cols-2 gap-4">
-          <!-- Module 0A: Oblivious DoH (ODoH) Relay Mode -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
-            <div>
-              <div class="flex items-center justify-between mb-2">
-                <div class="flex items-center gap-2">
-                  <Globe class="w-4 h-4 text-teal-400" />
-                  <span class="text-sm font-semibold text-slate-200">Oblivious DoH (ODoH) Relay Mode</span>
-                </div>
-                <button
-                  aria-label="Toggle Oblivious DoH Relay"
-                  onclick={() => handleToggle("odoh", status.odoh_enabled)}
-                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.odoh_enabled ? 'bg-teal-500' : 'bg-slate-700'}"
-                >
-                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.odoh_enabled ? 'translate-x-5' : ''}"></span>
-                </button>
-              </div>
-              <p class="text-xs text-slate-400 leading-relaxed mb-3">
-                Uses RFC 9230 HPKE encryption through blind Relays (Fastly/Numa) before reaching Cloudflare/Crypto.sx DNS. The Relay sees your IP only; the Target sees the domain only.
-              </p>
-            </div>
-            <div class="text-[10px] text-teal-300/90 bg-teal-950/40 p-2 rounded-lg border border-teal-800/30">
-              🛡️ <strong>Threat stopped:</strong> Upstream DNS resolvers correlating your IP with browsing history.
-            </div>
-          </div>
-
-          <!-- Module 0B: WebRTC Direct IP Leak Shield -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
-            <div>
-              <div class="flex items-center justify-between mb-2">
-                <div class="flex items-center gap-2">
-                  <ShieldAlert class="w-4 h-4 text-rose-400" />
-                  <span class="text-sm font-semibold text-slate-200">WebRTC Direct IP Leak Shield</span>
-                </div>
-                <button
-                  aria-label="Toggle WebRTC IP Leak Shield"
-                  onclick={() => handleToggle("webrtc", status.webrtc_shield)}
-                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.webrtc_shield ? 'bg-rose-500' : 'bg-slate-700'}"
-                >
-                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.webrtc_shield ? 'translate-x-5' : ''}"></span>
-                </button>
-              </div>
-              <p class="text-xs text-slate-400 leading-relaxed mb-3">
-                Intercepts sneaky WebRTC STUN/TURN UDP &amp; proxy bypass requests (ports 3478, 5349, 19302–19309, SOCKS5 UDP) used by browsers and chat apps to uncover your real ISP &amp; LAN IPs.
-              </p>
-            </div>
-            <div class="text-[10px] text-rose-300/90 bg-rose-950/40 p-2 rounded-lg border border-rose-800/30">
-              🛡️ <strong>Threat stopped:</strong> Proxy/VPN bypass via WebRTC STUN discovery.
-            </div>
-          </div>
-
-          <!-- Module 0C: JA3 / JA4 TLS Fingerprint Shuffling -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
-            <div>
-              <div class="flex items-center justify-between mb-2">
-                <div class="flex items-center gap-2">
-                  <Shuffle class="w-4 h-4 text-violet-400" />
-                  <span class="text-sm font-semibold text-slate-200">JA3 / JA4 TLS Fingerprint Shuffling</span>
-                </div>
-                <button
-                  aria-label="Toggle JA3 TLS Fingerprint Shuffling"
-                  onclick={() => handleToggle("ja3", status.ja3_shuffle)}
-                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.ja3_shuffle ? 'bg-violet-500' : 'bg-slate-700'}"
-                >
-                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.ja3_shuffle ? 'translate-x-5' : ''}"></span>
-                </button>
-              </div>
-              <p class="text-xs text-slate-400 leading-relaxed mb-3">
-                Rotates cipher suite order and ALPN tokens across outbound TLS connections, splits ClientHello records across multiple TLS frames, and normalizes plaintext HTTP User-Agent headers.
-              </p>
-            </div>
-            <div class="text-[10px] text-violet-300/90 bg-violet-950/40 p-2 rounded-lg border border-violet-800/30">
-              🛡️ <strong>Threat stopped:</strong> Passive TLS stack fingerprinting across sessions.
-            </div>
-          </div>
-
-          <!-- Module 0D: Hardware Snooping Sentinel -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
-            <div>
-              <div class="flex items-center justify-between mb-2">
-                <div class="flex items-center gap-2">
-                  <Camera class="w-4 h-4 text-emerald-400" />
-                  <span class="text-sm font-semibold text-slate-200">Camera &amp; Mic Snooping Sentinel</span>
-                </div>
-                <button
-                  aria-label="Toggle Hardware Snooping Sentinel"
-                  onclick={() => handleToggle("sentinel", status.hardware_sentinel_enabled)}
-                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.hardware_sentinel_enabled ? 'bg-emerald-500' : 'bg-slate-700'}"
-                >
-                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.hardware_sentinel_enabled ? 'translate-x-5' : ''}"></span>
-                </button>
-              </div>
-              <p class="text-xs text-slate-400 leading-relaxed mb-3">
-                Polls low-level CoreAudio &amp; CoreMediaIO device state silently (without triggering OS mic/camera permission prompts) to immediately flag which app activates your webcam or microphone.
-              </p>
-            </div>
-            <div class="text-[10px] text-emerald-300/90 bg-emerald-950/40 p-2 rounded-lg border border-emerald-800/30">
-              🛡️ <strong>Status:</strong> {metrics.camera_active || metrics.mic_active ? "SENSOR STREAM ACTIVE RIGHT NOW" : "Both sensors currently idle & guarded"}
-            </div>
-          </div>
-
-          <!-- Module 1: Search & Browsing Camouflage -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
-            <div>
-              <div class="flex items-center justify-between mb-2">
-                <div class="flex items-center gap-2">
-                  <Radio class="w-4 h-4 text-cyan-400" />
-                  <span class="text-sm font-semibold text-slate-200">Search & Browsing Camouflage</span>
-                </div>
-                <button
-                  aria-label="Toggle Camouflage Decoy Engine"
-                  onclick={() => handleToggle("chaff", status.chaff_enabled)}
-                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.chaff_enabled ? 'bg-cyan-500' : 'bg-slate-700'}"
-                >
-                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.chaff_enabled ? 'translate-x-5' : ''}"></span>
-                </button>
-              </div>
-              <p class="text-xs text-slate-400 leading-relaxed mb-3">
-                Intersperses realistic decoy DNS & search queries with randomized Poisson delays across Quad9, Mullvad, and Cloudflare to make automated profiling useless.
-              </p>
-            </div>
-            <div class="text-[10px] text-cyan-400/90 bg-cyan-950/40 p-2 rounded-lg border border-cyan-800/30">
-              🛡️ <strong>Threat stopped:</strong> ISP and advertiser timeline profiling.
-            </div>
-          </div>
-
-          <!-- Module 2: Anti-ISP SNI Packet Slicing -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
-            <div>
-              <div class="flex items-center justify-between mb-2">
-                <div class="flex items-center gap-2">
-                  <Lock class="w-4 h-4 text-emerald-400" />
-                  <span class="text-sm font-semibold text-slate-200">Anti-ISP Packet Slicing</span>
-                </div>
-                <button
-                  aria-label="Toggle Anti-ISP SNI Slicing"
-                  onclick={() => handleToggle("sni", status.sni_fragmentation)}
-                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.sni_fragmentation ? 'bg-emerald-500' : 'bg-slate-700'}"
-                >
-                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.sni_fragmentation ? 'translate-x-5' : ''}"></span>
-                </button>
-              </div>
-              <p class="text-xs text-slate-400 leading-relaxed mb-3">
-                Splits the unencrypted TLS 1.3 ClientHello packet right through the middle of the domain name so ISP Deep Packet Inspection boxes cannot see which websites you visit.
-              </p>
-            </div>
-            <div class="text-[10px] text-emerald-400/90 bg-emerald-950/40 p-2 rounded-lg border border-emerald-800/30">
-              🛡️ <strong>Threat stopped:</strong> ISP browsing history logging & surveillance.
-            </div>
-          </div>
-
-          <!-- Module 3: Local DNS Sinkhole & CNAME Uncloaking -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
-            <div>
-              <div class="flex items-center justify-between mb-2">
-                <div class="flex items-center gap-2">
-                  <EyeOff class="w-4 h-4 text-amber-400" />
-                  <span class="text-sm font-semibold text-slate-200">Ad Sinkhole & Stealth Tracker Blocker</span>
-                </div>
-                <button
-                  aria-label="Toggle DNS Sinkhole"
-                  onclick={() => handleToggle("dns", status.dns_enabled)}
-                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.dns_enabled ? 'bg-amber-500' : 'bg-slate-700'}"
-                >
-                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.dns_enabled ? 'translate-x-5' : ''}"></span>
-                </button>
-              </div>
-              <p class="text-xs text-slate-400 leading-relaxed mb-3">
-                Instantly drops connections to known tracking servers. Unmasks sneaky first-party CNAME aliases that websites use to bypass normal browser ad-blockers.
-              </p>
-            </div>
-            <div class="text-[10px] text-amber-400/90 bg-amber-950/40 p-2 rounded-lg border border-amber-800/30">
-              🛡️ <strong>Threat stopped:</strong> Cross-site telemetry & disguised analytics.
-            </div>
-          </div>
-
-          <!-- Module 4: Clipboard Link Cleaner -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
-            <div>
-              <div class="flex items-center justify-between mb-2">
-                <div class="flex items-center gap-2">
-                  <Filter class="w-4 h-4 text-indigo-400" />
-                  <span class="text-sm font-semibold text-slate-200">Clipboard Tracking Link Stripper</span>
-                </div>
-                <button
-                  aria-label="Toggle Clipboard Sanitizer"
-                  onclick={() => handleToggle("clipboard", status.clipboard_cleaner)}
-                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.clipboard_cleaner ? 'bg-indigo-500' : 'bg-slate-700'}"
-                >
-                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.clipboard_cleaner ? 'translate-x-5' : ''}"></span>
-                </button>
-              </div>
-              <p class="text-xs text-slate-400 leading-relaxed mb-3">
-                Silently listens to your clipboard in the background. When you copy links from YouTube, TikTok, or emails, it removes 250+ tracking tokens (fbclid, utm_*, si) in &lt;1ms.
-              </p>
-            </div>
-            <div class="text-[10px] text-indigo-400/90 bg-indigo-950/40 p-2 rounded-lg border border-indigo-800/30">
-              🛡️ <strong>Threat stopped:</strong> Link tracking & identity tagging when sharing URLs.
-            </div>
-          </div>
-
-          <!-- Module 5: OS System Proxy Integration -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
-            <div>
-              <div class="flex items-center justify-between mb-2">
-                <div class="flex items-center gap-2">
-                  <Activity class="w-4 h-4 text-blue-400" />
-                  <span class="text-sm font-semibold text-slate-200">OS Proxy Auto-Routing (:1080)</span>
-                </div>
-                <button
-                  aria-label="Toggle System Proxy"
-                  onclick={() => handleToggle("proxy", status.proxy_enabled)}
-                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.proxy_enabled ? 'bg-blue-500' : 'bg-slate-700'}"
-                >
-                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.proxy_enabled ? 'translate-x-5' : ''}"></span>
-                </button>
-              </div>
-              <p class="text-xs text-slate-400 leading-relaxed mb-3">
-                Automatically instructs macOS to route HTTP, HTTPS, and SOCKS5 connections through your local shield daemon. Automatically resets to direct connection on quit.
-              </p>
-            </div>
-            <div class="text-[10px] text-blue-400/90 bg-blue-950/40 p-2 rounded-lg border border-blue-800/30">
-              🛡️ <strong>Status:</strong> {status.os_proxy_active ? "Actively routing OS traffic" : "Inactive in OS settings"}
-            </div>
-          </div>
-
-          <!-- Module 6: PII & Secret Redactor -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
-            <div>
-              <div class="flex items-center justify-between mb-2">
-                <div class="flex items-center gap-2">
-                  <ShieldCheck class="w-4 h-4 text-cyan-400" />
-                  <span class="text-sm font-semibold text-slate-200">AI & Chat PII Masker</span>
-                </div>
-                <button
-                  aria-label="Toggle Chat PII Masker"
-                  onclick={() => handleToggle("pii", status.pii_redactor)}
-                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.pii_redactor ? 'bg-cyan-500' : 'bg-slate-700'}"
-                >
-                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.pii_redactor ? 'translate-x-5' : ''}"></span>
-                </button>
-              </div>
-              <p class="text-xs text-slate-400 leading-relaxed mb-3">
-                Masks credit card numbers (Luhn validated), API keys, passwords, emails, and phone numbers before they are sent to AI chat models like ChatGPT or Claude.
-              </p>
-            </div>
-            <div class="text-[10px] text-cyan-400/90 bg-cyan-950/40 p-2 rounded-lg border border-cyan-800/30">
-              🛡️ <strong>Threat stopped:</strong> Data leakage to AI model training sets.
-            </div>
-          </div>
-
-          <!-- Module 7: Menu Bar Tray Companion -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between col-span-2">
-            <div>
-              <div class="flex items-center justify-between mb-2">
-                <div class="flex items-center gap-2">
-                  <AppWindow class="w-4 h-4 text-sky-400" />
-                  <span class="text-sm font-semibold text-slate-200">Run Quietly in Menu Bar When Closing Window</span>
-                </div>
-                <button
-                  aria-label="Toggle Run in Menu Bar on Close"
-                  onclick={() => handleToggle("minimize_to_tray", status.minimize_to_tray)}
-                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.minimize_to_tray ? 'bg-sky-500' : 'bg-slate-700'}"
-                >
-                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.minimize_to_tray ? 'translate-x-5' : ''}"></span>
-                </button>
-              </div>
-              <p class="text-xs text-slate-400 leading-relaxed mb-2">
-                When enabled, clicking the red close button hides the window to the macOS Menu Bar companion so your privacy shields stay active uninterrupted. To stop all protection and restore direct networking, choose <strong>Quit Ephemeral Privacy</strong> from the Menu Bar icon (or press <kbd class="px-1 py-0.5 rounded bg-slate-800 text-slate-300 font-mono">Cmd+Q</kbd>).
-              </p>
-            </div>
-            <div class="text-[10px] text-sky-300/90 bg-sky-950/40 p-2 rounded-lg border border-sky-800/30">
-              🖥️ <strong>Behavior:</strong> {status.minimize_to_tray ? "Closing window hides to Menu Bar tray (protection continues)" : "Closing window exits app and resets OS network proxy"}
-            </div>
-          </div>
-        </div>
-      </div>
-    {:else if activeTab === "ai_sandbox"}
-      <!-- AI & CHAT SANITIZER PLAYGROUND -->
-      <div class="max-w-4xl mx-auto space-y-5">
-        <div>
-          <h2 class="text-base font-bold text-slate-100 flex items-center gap-2">
-            <Lock class="w-5 h-5 text-cyan-400" />
-            AI & Chat Privacy Shield
-          </h2>
-          <p class="text-xs text-slate-400 mt-1">
-            Before pasting your code or queries into ChatGPT, Claude, or Copilot, sanitize them here. Sensitive data is replaced with anonymous tokens that can be restored with 1 click after the AI responds.
-          </p>
-        </div>
-
-        <div class="grid grid-cols-2 gap-4">
-          <!-- Input Box -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col">
-            <span class="text-xs font-semibold text-slate-300 mb-2 block">1. Your Original Prompt (Sensitive Data Stays Local)</span>
-            <textarea
-              bind:value={sandboxInput}
-              class="flex-1 w-full bg-slate-950/80 border border-slate-800 rounded-xl p-3 text-xs font-mono text-slate-200 resize-none focus:outline-none focus:border-cyan-500 min-h-[160px]"
-            ></textarea>
-            <button
-              onclick={runSandboxRedact}
-              class="mt-3 px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-xs font-semibold text-white transition-colors flex items-center justify-center gap-2"
-            >
-              <Zap class="w-3.5 h-3.5" />
-              Scrub Secrets & Sensitive Data
-            </button>
-          </div>
-
-          <!-- Output Box -->
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col">
-            <div class="flex items-center justify-between mb-2">
-              <span class="text-xs font-semibold text-cyan-300">2. Sanitized Prompt (Safe to Paste to AI)</span>
-              {#if sandboxResult}
-                <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-cyan-950 text-cyan-300 border border-cyan-800/60">
-                  {sandboxResult.redactions_count} Secrets Masked
-                </span>
-              {/if}
-            </div>
-            <div class="flex-1 w-full bg-slate-950/80 border border-slate-800 rounded-xl p-3 text-xs font-mono text-slate-300 overflow-y-auto min-h-[160px] whitespace-pre-wrap select-all">
-              {sandboxResult?.sanitized_text || "Click 'Scrub Secrets' to generate sanitized text..."}
-            </div>
-            <button
-              onclick={runSandboxRestore}
-              disabled={!sandboxResult}
-              class="mt-3 px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
-            >
-              <RefreshCw class="w-3.5 h-3.5" />
-              3. Un-mask AI Answer (Restore Real Data)
-            </button>
-          </div>
-        </div>
-
-        {#if sandboxResult && Object.keys(sandboxResult.token_map).length > 0}
-          <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
-            <h4 class="text-xs font-semibold text-slate-300 mb-2">In-Memory Secret Vault (RAM Only, Never Sent Anywhere)</h4>
-            <div class="grid grid-cols-2 gap-2">
-              {#each Object.entries(sandboxResult.token_map) as [token, orig]}
-                <div class="bg-slate-950/80 border border-slate-800 rounded-lg p-2 text-xs font-mono flex items-center justify-between">
-                  <span class="text-cyan-400 font-bold">{token}</span>
-                  <span class="text-slate-500 truncate max-w-[240px]">{orig}</span>
+                  <button
+                    aria-label={`Toggle ${item.title}`}
+                    onclick={() => handleToggle(item.key, item.on)}
+                    class="w-11 h-6 rounded-full transition-colors relative shrink-0 {item.on ? 'bg-emerald-500' : 'bg-zinc-700'}"
+                  >
+                    <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {item.on ? 'translate-x-5' : ''}"></span>
+                  </button>
                 </div>
               {/each}
             </div>
           </div>
-        {/if}
 
-        {#if sandboxRestored}
-          <div class="bg-slate-900/60 border border-emerald-800/40 rounded-2xl p-4">
-            <h4 class="text-xs font-semibold text-emerald-400 mb-1 flex items-center gap-1.5">
-              <CheckCircle class="w-4 h-4" />
-              Restored AI Response (Original Sensitive Values Re-inserted):
-            </h4>
-            <p class="text-xs font-mono text-slate-200 select-all">{sandboxRestored}</p>
+          <!-- Group 2: Leak & Hardware Watchdogs -->
+          <div class="space-y-2">
+            <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 px-1">IP Leak &amp; Sensor Defense</h2>
+            <div class="bg-[#0b0f14] border border-white/[0.07] rounded-xl divide-y divide-white/[0.06]">
+              <div class="px-5 py-4 flex items-center justify-between gap-6">
+                <div class="space-y-1 min-w-0">
+                  <div class="flex items-center gap-2">
+                    <span class="text-sm font-medium text-zinc-100">Stop Real IP Leaks in Calls &amp; Chat</span>
+                    <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/[0.04] text-zinc-400 border border-white/[0.06]">WebRTC Shield</span>
+                  </div>
+                  <p class="text-xs text-zinc-400 leading-relaxed">
+                    Blocks STUN/TURN leak probes (ports 3478, 5349, 19302) and SOCKS5 UDP bypasses so apps cannot discover your true home IP.
+                  </p>
+                </div>
+                <button
+                  aria-label="Toggle WebRTC IP Leak Shield"
+                  onclick={() => handleToggle("webrtc", status.webrtc_shield)}
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.webrtc_shield ? 'bg-emerald-500' : 'bg-zinc-700'}"
+                >
+                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.webrtc_shield ? 'translate-x-5' : ''}"></span>
+                </button>
+              </div>
+
+              <div class="px-5 py-4 flex items-center justify-between gap-6">
+                <div class="space-y-1 min-w-0">
+                  <div class="flex items-center gap-2">
+                    <span class="text-sm font-medium text-zinc-100">Camera &amp; Microphone Watchdog</span>
+                    <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/[0.04] text-zinc-400 border border-white/[0.06]">Hardware Sentinel</span>
+                  </div>
+                  <p class="text-xs text-zinc-400 leading-relaxed">
+                    Quietly monitors CoreAudio and CoreMediaIO hardware state (with zero macOS permission popups) and alerts whenever a camera or mic turns on.
+                  </p>
+                </div>
+                <button
+                  aria-label="Toggle Camera & Mic Watchdog"
+                  onclick={() => handleToggle("sentinel", status.hardware_sentinel_enabled)}
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.hardware_sentinel_enabled ? 'bg-emerald-500' : 'bg-zinc-700'}"
+                >
+                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.hardware_sentinel_enabled ? 'translate-x-5' : ''}"></span>
+                </button>
+              </div>
+            </div>
           </div>
-        {/if}
-      </div>
-    {:else if activeTab === "url_cleaner"}
-      <!-- LINK DE-TRACKER TOOL -->
-      <div class="max-w-3xl mx-auto space-y-5">
-        <div>
-          <h2 class="text-base font-bold text-slate-100 flex items-center gap-2">
-            <Filter class="w-5 h-5 text-indigo-400" />
-            Tracking Link Stripper
-          </h2>
-          <p class="text-xs text-slate-400 mt-1">
-            Social networks (Facebook, Twitter, TikTok, YouTube) and email marketing platforms append tracking identifiers to links. Our background clipboard guard automatically strips them whenever you copy any link. You can also test any URL manually below:
-          </p>
+
+          <!-- Group 3: App & System Preferences -->
+          <div class="space-y-2">
+            <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 px-1">App &amp; Clipboard Preferences</h2>
+            <div class="bg-[#0b0f14] border border-white/[0.07] rounded-xl divide-y divide-white/[0.06]">
+              <div class="px-5 py-4 flex items-center justify-between gap-6">
+                <div class="space-y-1 min-w-0">
+                  <div class="text-sm font-medium text-zinc-100">Strip Tracking Codes From Copied Links</div>
+                  <p class="text-xs text-zinc-400 leading-relaxed">
+                    Removes tracking tokens like <code class="text-zinc-300">fbclid</code>, <code class="text-zinc-300">utm_*</code>, and share IDs automatically when you copy URLs.
+                  </p>
+                </div>
+                <button
+                  aria-label="Toggle Clipboard Link Stripper"
+                  onclick={() => handleToggle("clipboard", status.clipboard_cleaner)}
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.clipboard_cleaner ? 'bg-emerald-500' : 'bg-zinc-700'}"
+                >
+                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.clipboard_cleaner ? 'translate-x-5' : ''}"></span>
+                </button>
+              </div>
+
+              <div class="px-5 py-4 flex items-center justify-between gap-6">
+                <div class="space-y-1 min-w-0">
+                  <div class="text-sm font-medium text-zinc-100">Route System Traffic Through Shield</div>
+                  <p class="text-xs text-zinc-400 leading-relaxed">
+                    Sets your Mac's active network proxy to <code class="text-zinc-300">127.0.0.1:1080</code> while running, and automatically restores direct networking on quit.
+                  </p>
+                </div>
+                <button
+                  aria-label="Toggle OS Proxy Routing"
+                  onclick={() => handleToggle("proxy", status.proxy_enabled)}
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.proxy_enabled ? 'bg-emerald-500' : 'bg-zinc-700'}"
+                >
+                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.proxy_enabled ? 'translate-x-5' : ''}"></span>
+                </button>
+              </div>
+
+              <div class="px-5 py-4 flex items-center justify-between gap-6">
+                <div class="space-y-1 min-w-0">
+                  <div class="text-sm font-medium text-zinc-100">Run Quietly in Menu Bar When Window Closes</div>
+                  <p class="text-xs text-zinc-400 leading-relaxed">
+                    Clicking close keeps shields running in your macOS Menu Bar. Choose <strong>Quit Ephemeral Privacy</strong> from the Menu Bar or press <kbd class="px-1 py-0.5 rounded bg-white/[0.06] text-zinc-300 font-mono text-[11px]">Cmd+Q</kbd> to exit completely.
+                  </p>
+                </div>
+                <button
+                  aria-label="Toggle Run in Menu Bar on Close"
+                  onclick={() => handleToggle("minimize_to_tray", status.minimize_to_tray)}
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0 {status.minimize_to_tray ? 'bg-emerald-500' : 'bg-zinc-700'}"
+                >
+                  <span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform {status.minimize_to_tray ? 'translate-x-5' : ''}"></span>
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
 
-        <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 space-y-4 shadow-lg">
-          <div>
-            <span class="text-xs font-medium text-slate-300 block mb-1.5">Input URL with Tracking Parameters</span>
-            <input
-              type="text"
-              bind:value={testUrlInput}
-              class="w-full bg-slate-950/80 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs font-mono text-slate-200 focus:outline-none focus:border-indigo-500"
-            />
-          </div>
-
-          <button
-            onclick={runUrlCleaner}
-            class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white transition-colors flex items-center gap-2"
-          >
-            <Filter class="w-3.5 h-3.5" />
-            Strip Tracking Parameters
-          </button>
-
-          {#if testUrlCleaned}
-            <div class="pt-2 border-t border-slate-800/80">
-              <div class="text-xs font-semibold text-indigo-300 mb-1 flex items-center gap-1.5">
-                <CheckCircle class="w-4 h-4 text-emerald-400" />
-                Sanitized URL (Clean &amp; Safe to Share):
+      {:else if activeSection === "audit"}
+        <!-- INTERACTIVE PRIVACY CHECKUP & TELEMETRY DOMAINS -->
+        <div class="max-w-3xl mx-auto space-y-5">
+          <!-- Top Summary Strip -->
+          <section class="bg-[#0b0f14] border border-white/[0.07] rounded-xl p-6 flex items-center justify-between gap-6">
+            <div class="flex items-center gap-5">
+              <div class="px-4 py-3 rounded-xl bg-[#050709] border border-white/[0.08] text-center min-w-[96px]">
+                <div class="text-3xl font-bold font-mono tabular-nums {auditReport ? (auditReport.score >= 85 ? 'text-emerald-400' : auditReport.score >= 60 ? 'text-amber-400' : 'text-rose-400') : 'text-zinc-500'}">
+                  {auditReport ? auditReport.score : "--"}
+                </div>
+                <div class="text-[10px] font-mono text-zinc-500 mt-0.5">/ 100 SCORE</div>
               </div>
-              <div class="bg-slate-950/90 border border-slate-800 rounded-xl p-3 text-xs font-mono text-emerald-300 break-all select-all">
-                {testUrlCleaned}
+
+              <div class="space-y-1">
+                <div class="flex items-center gap-2.5">
+                  <h1 class="text-lg font-semibold tracking-tight text-zinc-100">Live Security Check</h1>
+                  {#if auditReport}
+                    <span class="text-[11px] font-mono px-2 py-0.5 rounded border {auditReport.score >= 85 ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/25' : auditReport.score >= 60 ? 'bg-amber-500/10 text-amber-300 border-amber-500/25' : 'bg-rose-500/10 text-rose-300 border-rose-500/25'}">
+                      {auditReport.score >= 85 ? "VERIFIED" : auditReport.score >= 60 ? "PARTIAL" : "AT RISK"}
+                    </span>
+                  {/if}
+                </div>
+                <p class="text-xs text-zinc-400 max-w-md leading-relaxed">
+                  Tests real local proxy routing, double-blind ODoH DNS, WebRTC IP leak blocking, TLS record slicing, tracker sinkholing, and hardware sensors.
+                </p>
+                {#if auditReport}
+                  <div class="text-[11px] font-mono text-zinc-500 inline-flex items-center gap-1.5 pt-0.5">
+                    <Clock class="w-3 h-3" />
+                    Last verified {new Date(auditReport.timestamp * 1000).toLocaleTimeString()}
+                  </div>
+                {/if}
               </div>
+            </div>
+
+            <button
+              onclick={runPrivacyAudit}
+              disabled={isAuditRunning}
+              class="px-4 py-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-xs font-semibold text-zinc-950 transition-colors inline-flex items-center gap-2 shrink-0"
+            >
+              {#if isAuditRunning}
+                <RefreshCw class="w-4 h-4 animate-spin" />
+                Checking...
+              {:else}
+                <Play class="w-3.5 h-3.5" />
+                Run Check
+              {/if}
+            </button>
+          </section>
+
+          {#if auditReport}
+            <section class="bg-[#0b0f14] border border-white/[0.07] rounded-xl divide-y divide-white/[0.06]">
+              {#each auditReport.checks as check (check.id)}
+                <div class="p-4">
+                  <div class="flex items-center justify-between gap-4">
+                    <div class="flex items-start gap-3 min-w-0">
+                      {#if check.status === "PASS"}
+                        <CheckCircle class="w-4 h-4 text-emerald-400 mt-0.5 shrink-0" />
+                      {:else if check.status === "WARN"}
+                        <AlertTriangle class="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />
+                      {:else}
+                        <ShieldAlert class="w-4 h-4 text-rose-400 mt-0.5 shrink-0" />
+                      {/if}
+                      <div class="space-y-0.5 min-w-0">
+                        <div class="flex items-center gap-2">
+                          <span class="text-sm font-medium text-zinc-100">{check.name}</span>
+                          <span class="text-[10px] font-mono px-1.5 py-0.5 rounded border {check.status === 'PASS' ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/25' : check.status === 'WARN' ? 'bg-amber-500/10 text-amber-300 border-amber-500/25' : 'bg-rose-500/10 text-rose-300 border-rose-500/25'}">
+                            {check.status}
+                          </span>
+                        </div>
+                        <p class="text-xs text-zinc-400 leading-relaxed">{check.summary}</p>
+                      </div>
+                    </div>
+
+                    <div class="flex items-center gap-3 shrink-0">
+                      <span class="text-[11px] font-mono tabular-nums text-zinc-500">{check.latency_ms}ms</span>
+                      <span class="text-[11px] font-mono tabular-nums text-zinc-300">{check.points_earned}/{check.max_points}</span>
+                      <button
+                        onclick={() => toggleProof(check.id)}
+                        class="px-2.5 py-1 rounded-md bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.07] text-[11px] text-zinc-300 inline-flex items-center gap-1 transition-colors"
+                      >
+                        Details
+                        {#if expandedAuditProofs[check.id]}
+                          <ChevronUp class="w-3 h-3" />
+                        {:else}
+                          <ChevronDown class="w-3 h-3" />
+                        {/if}
+                      </button>
+                    </div>
+                  </div>
+
+                  {#if expandedAuditProofs[check.id]}
+                    <div class="mt-3 ml-7 text-[11px] font-mono text-cyan-300 bg-[#050709] border border-white/[0.07] rounded-lg p-3 select-all break-all">
+                      {check.proof}
+                    </div>
+                  {/if}
+                </div>
+              {/each}
+            </section>
+          {:else if !isAuditRunning}
+            <div class="bg-[#0b0f14] border border-white/[0.07] rounded-xl p-10 text-center text-xs text-zinc-400">
+              Click <strong class="text-zinc-200">Run Check</strong> to run live leak and configuration diagnostics.
             </div>
           {/if}
-        </div>
-      </div>
-    {:else if activeTab === "os_telemetry"}
-      <!-- OS TELEMETRY PROFILES -->
-      <div class="max-w-3xl mx-auto space-y-5">
-        <div>
-          <h2 class="text-base font-bold text-slate-100 flex items-center gap-2">
-            <Layers class="w-5 h-5 text-cyan-400" />
-            Operating System Telemetry Audit
-          </h2>
-          <p class="text-xs text-slate-400 mt-1">
-            macOS, Windows, and Linux operating systems continuously ping diagnostic servers with unique machine IDs and crash telemetry. Below is the list of OS telemetry endpoints blocked by your local DNS sinkhole:
-          </p>
-        </div>
 
-        <div class="space-y-3">
-          {#each telemetryList as item}
-            <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex items-start justify-between">
-              <div class="space-y-1">
-                <div class="flex items-center gap-2">
-                  <span class="text-xs font-mono px-2 py-0.5 rounded uppercase font-semibold bg-slate-800 text-slate-300">
-                    {item.os}
-                  </span>
-                  <span class="text-sm font-semibold text-slate-200">{item.name}</span>
+          <!-- Blocked OS Telemetry Expandable List -->
+          <section class="bg-[#0b0f14] border border-white/[0.07] rounded-xl overflow-hidden">
+            <button
+              onclick={() => (showTelemetryList = !showTelemetryList)}
+              class="w-full px-5 py-3.5 flex items-center justify-between text-left hover:bg-white/[0.02] transition-colors"
+            >
+              <div>
+                <div class="text-sm font-medium text-zinc-200">
+                  Built-In OS Telemetry Blocklist ({telemetryList.length})
                 </div>
-                <p class="text-xs text-slate-400 leading-relaxed">{item.description}</p>
+                <div class="text-xs text-zinc-500">macOS, Windows, and Linux diagnostic servers dropped silently by the local sinkhole.</div>
               </div>
-              <span class="text-[10px] font-mono px-2 py-1 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/60 shrink-0 font-semibold">
-                SINKHOLED
+              <span class="text-xs text-zinc-400 inline-flex items-center gap-1 shrink-0">
+                {showTelemetryList ? "Hide" : "Inspect"}
+                {#if showTelemetryList}
+                  <ChevronUp class="w-3.5 h-3.5" />
+                {:else}
+                  <ChevronDown class="w-3.5 h-3.5" />
+                {/if}
               </span>
-            </div>
-          {/each}
-        </div>
-      </div>
-    {/if}
-  </main>
+            </button>
 
-  <!-- BOTTOM STATUS BAR -->
-  <footer class="h-8 border-t border-slate-800/80 bg-slate-950 px-6 flex items-center justify-between text-[11px] text-slate-500 shrink-0 font-mono">
-    <div class="flex items-center gap-3">
-      <span>UPSTREAM: {status.upstream_resolver}</span>
-      <span>•</span>
-      <span>CAMOUFLAGE: {status.chaff_intensity}</span>
-      <span>•</span>
-      <span class={status.os_proxy_active ? "text-emerald-400" : "text-amber-400"}>
-        OS ROUTING: {status.os_proxy_active ? "ACTIVE" : "INACTIVE"}
-      </span>
-    </div>
-    <div>ZERO-KNOWLEDGE RAM ARCHITECTURE • NO DISK LOGS</div>
-  </footer>
+            {#if showTelemetryList}
+              <div class="border-t border-white/[0.06] divide-y divide-white/[0.05]">
+                {#each telemetryList as item}
+                  <div class="px-5 py-3 flex items-start justify-between gap-4">
+                    <div class="space-y-0.5">
+                      <div class="flex items-center gap-2">
+                        <span class="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-white/[0.05] text-zinc-300">{item.os}</span>
+                        <span class="text-xs font-medium text-zinc-200">{item.name}</span>
+                      </div>
+                      <p class="text-[11px] text-zinc-400">{item.description}</p>
+                    </div>
+                    <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/25 shrink-0">
+                      BLOCKED
+                    </span>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </section>
+        </div>
+
+      {:else if activeSection === "tools"}
+        <!-- CLEAN 2-TOOL PRIVACY WORKBENCH -->
+        <div class="max-w-4xl mx-auto space-y-6">
+          <div>
+            <h1 class="text-lg font-semibold tracking-tight text-zinc-100">Privacy Tools</h1>
+            <p class="text-xs text-zinc-400 mt-1">Hide private secrets before using AI chatbots, or strip tracking codes from URLs.</p>
+          </div>
+
+          <!-- Tool 1: URL Tracking Link Cleaner -->
+          <section class="bg-[#0b0f14] border border-white/[0.07] rounded-xl p-5 space-y-3.5">
+            <div>
+              <h2 class="text-sm font-semibold text-zinc-100">Remove Tracking Codes From Links</h2>
+              <p class="text-xs text-zinc-400 mt-0.5">Your copied links are cleaned automatically in the background. You can also test or clean any link manually below.</p>
+            </div>
+
+            <div class="flex gap-2.5">
+              <input
+                type="text"
+                bind:value={testUrlInput}
+                aria-label="URL with tracking parameters"
+                class="flex-1 bg-[#050709] border border-white/[0.08] rounded-lg px-3.5 py-2 text-xs font-mono text-zinc-200 focus:outline-none focus:border-emerald-500/60 select-text"
+              />
+              <button
+                onclick={runUrlCleaner}
+                class="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-xs font-semibold text-zinc-950 transition-colors shrink-0"
+              >
+                Clean Link
+              </button>
+            </div>
+
+            {#if testUrlCleaned}
+              <div class="bg-[#050709] border border-white/[0.07] rounded-lg p-3 flex items-center justify-between gap-3">
+                <div class="text-xs font-mono text-emerald-300 break-all select-all">{testUrlCleaned}</div>
+                <button
+                  onclick={() => copyText(testUrlCleaned || "", "url")}
+                  class="px-2.5 py-1 rounded bg-white/[0.05] hover:bg-white/[0.1] text-[11px] text-zinc-200 inline-flex items-center gap-1 shrink-0 transition-colors"
+                >
+                  {#if copiedUrl}
+                    <Check class="w-3 h-3 text-emerald-400" />
+                    Copied
+                  {:else}
+                    <Copy class="w-3 h-3" />
+                    Copy
+                  {/if}
+                </button>
+              </div>
+            {/if}
+          </section>
+
+          <!-- Tool 2: Hide Secrets Before Using AI -->
+          <section class="bg-[#0b0f14] border border-white/[0.07] rounded-xl p-5 space-y-4">
+            <div class="flex items-center justify-between">
+              <div>
+                <h2 class="text-sm font-semibold text-zinc-100">Hide Private Details Before Pasting to AI</h2>
+                <p class="text-xs text-zinc-400 mt-0.5">Replaces emails, API keys, and credit cards locally with safe placeholders. Restore real values after the AI replies.</p>
+              </div>
+              {#if sandboxResult}
+                <span class="text-[11px] font-mono px-2.5 py-1 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/25">
+                  {sandboxResult.redactions_count} Masked
+                </span>
+              {/if}
+            </div>
+
+            <div class="grid grid-cols-2 gap-4">
+              <div class="space-y-2">
+                <label for="ai-prompt-input" class="text-xs font-medium text-zinc-300 block">1. Original Text (Stays on This Mac)</label>
+                <textarea
+                  id="ai-prompt-input"
+                  bind:value={sandboxInput}
+                  class="w-full bg-[#050709] border border-white/[0.08] rounded-lg p-3 text-xs font-mono text-zinc-200 resize-none focus:outline-none focus:border-emerald-500/60 h-36 select-text"
+                ></textarea>
+                <button
+                  onclick={runSandboxRedact}
+                  class="w-full py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-xs font-semibold text-zinc-950 transition-colors"
+                >
+                  Mask Secrets
+                </button>
+              </div>
+
+              <div class="space-y-2">
+                <div class="flex items-center justify-between">
+                  <span class="text-xs font-medium text-zinc-300">2. Safe Text to Paste</span>
+                  {#if sandboxResult?.sanitized_text}
+                    <button
+                      onclick={() => copyText(sandboxResult?.sanitized_text || "", "masked")}
+                      class="text-[11px] text-zinc-400 hover:text-zinc-100 inline-flex items-center gap-1"
+                    >
+                      {#if copiedMasked}
+                        <Check class="w-3 h-3 text-emerald-400" />
+                        Copied
+                      {:else}
+                        <Copy class="w-3 h-3" />
+                        Copy Safe Text
+                      {/if}
+                    </button>
+                  {/if}
+                </div>
+                <div class="w-full bg-[#050709] border border-white/[0.08] rounded-lg p-3 text-xs font-mono text-zinc-300 overflow-y-auto h-36 whitespace-pre-wrap select-all">
+                  {sandboxResult?.sanitized_text || "Click 'Mask Secrets' to sanitize text."}
+                </div>
+                <button
+                  onclick={runSandboxRestore}
+                  disabled={!sandboxResult}
+                  class="w-full py-2 rounded-lg bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] text-xs font-medium text-zinc-200 transition-colors disabled:opacity-40"
+                >
+                  Restore Real Details From AI Output
+                </button>
+              </div>
+            </div>
+
+            {#if sandboxRestored}
+              <div class="bg-[#050709] border border-emerald-500/30 rounded-lg p-3 text-xs space-y-1">
+                <div class="font-medium text-emerald-400">Restored Text:</div>
+                <p class="font-mono text-zinc-200 select-all break-words">{sandboxRestored}</p>
+              </div>
+            {/if}
+
+            {#if sandboxResult && Object.keys(sandboxResult.token_map).length > 0}
+              <div class="pt-1">
+                <button
+                  onclick={() => (showVaultMap = !showVaultMap)}
+                  class="text-[11px] text-zinc-400 hover:text-zinc-200 inline-flex items-center gap-1"
+                >
+                  {showVaultMap ? "Hide temporary placeholder map" : "View temporary placeholder map"}
+                  {#if showVaultMap}
+                    <ChevronUp class="w-3 h-3" />
+                  {:else}
+                    <ChevronDown class="w-3 h-3" />
+                  {/if}
+                </button>
+
+                {#if showVaultMap}
+                  <div class="mt-2.5 grid grid-cols-2 gap-2">
+                    {#each Object.entries(sandboxResult.token_map) as [token, orig]}
+                      <div class="bg-[#050709] border border-white/[0.06] rounded-lg px-3 py-2 text-[11px] font-mono flex items-center justify-between gap-2">
+                        <span class="text-emerald-400 font-semibold">{token}</span>
+                        <span class="text-zinc-500 truncate">{orig}</span>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            {/if}
+          </section>
+        </div>
+      {/if}
+    </main>
+  </div>
 </div>
