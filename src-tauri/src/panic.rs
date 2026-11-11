@@ -4,7 +4,10 @@ use std::process::Command;
 use std::sync::Arc;
 
 pub async fn execute_panic_killswitch(state: Arc<AppState>) -> Result<String, String> {
-    // 1. Instantly unconfigure OS system proxy
+    // 1. Instantly unconfigure OS system proxy and sync UI toggle state
+    state
+        .proxy_enabled
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     let _ = disable_system_proxy();
 
     // 2. Clear OS DNS Cache

@@ -63,6 +63,7 @@
     ja3_fingerprints_shuffled: 0,
     hardware_alerts_count: 0,
     blocklist_rules: 0,
+    odoh_fallback_active: false,
     camera_active: false,
     mic_active: false,
     camera_apps: [] as string[],
@@ -233,11 +234,13 @@
 
   async function triggerManualBurst() {
     try {
-      await invoke("trigger_manual_chaff_burst");
-      decoySentFeedback = true;
-      setTimeout(() => {
-        decoySentFeedback = false;
-      }, 2000);
+      const sent = await invoke<boolean>("trigger_manual_chaff_burst");
+      if (sent) {
+        decoySentFeedback = true;
+        setTimeout(() => {
+          decoySentFeedback = false;
+        }, 2000);
+      }
       await fetchStatus();
     } catch (e) {
       console.error("Manual burst error:", e);
@@ -433,10 +436,16 @@
       <!-- Decoy Noise Action -->
       <button
         onclick={triggerManualBurst}
-        class="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-[#10151c] hover:bg-[#161d26] border border-white/[0.08] text-xs font-medium text-zinc-200 transition-colors"
-        title="Mix harmless background searches with your traffic to confuse ad trackers"
+        disabled={!status.chaff_enabled}
+        class="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-[#10151c] hover:bg-[#161d26] disabled:opacity-45 disabled:cursor-not-allowed border border-white/[0.08] text-xs font-medium text-zinc-200 transition-colors"
+        title={status.chaff_enabled
+          ? "Mix harmless background searches with your traffic to confuse ad trackers"
+          : "Enable Decoy Noise in Protections before triggering a manual burst"}
       >
-        {#if decoySentFeedback}
+        {#if !status.chaff_enabled}
+          <Radio class="w-3.5 h-3.5 text-zinc-500" />
+          <span class="text-zinc-400">Decoy Mode Off</span>
+        {:else if decoySentFeedback}
           <Check class="w-3.5 h-3.5 text-emerald-400" />
           <span class="text-emerald-300">Decoys Sent</span>
         {:else}
@@ -538,7 +547,7 @@
                 </div>
                 <p class="text-[13px] text-zinc-400 leading-relaxed">
                   {#if status.os_proxy_active && status.proxy_enabled}
-                    Web lookups use {status.odoh_enabled ? "double-blind DNS relays" : "encrypted DNS"}, trackers and IP leak probes are blocked locally, and decoy noise keeps advertisers guessing.
+                    Browser &amp; proxy-routed lookups use {status.odoh_enabled ? (metrics.odoh_fallback_active ? "encrypted DoH (ODoH relay fallback)" : "double-blind ODoH DNS relays") : "encrypted DoH"}, trackers are sinkholed locally, and decoy noise masks browsing timing.
                   {:else}
                     Automatic OS routing is paused right now. Turn on the system shield above or inside Protections to resume full protection.
                   {/if}
@@ -578,7 +587,7 @@
                   {/each}
                 </div>
                 <div class="text-[11px] font-mono text-zinc-500">
-                  {status.odoh_enabled ? "Double-Blind ODoH" : "Encrypted DoH"} · Proxy :1080
+                  {status.odoh_enabled ? (metrics.odoh_fallback_active ? "Encrypted DoH (Relay Fallback)" : "Double-Blind ODoH") : "Encrypted DoH"} · Proxy :1080
                 </div>
               </div>
             </div>
@@ -689,13 +698,13 @@
               <div class="px-4 py-2.5 bg-[#10151c] border-t border-white/[0.06] text-xs flex items-center justify-between text-zinc-300">
                 <span>
                   {#if activeGlossary === "sites"}
-                    Total web &amp; app connections routed through your Mac's private shield instead of going directly to your ISP's plain DNS.
+                    Web &amp; app connections routed through the local shield (:1080) using encrypted DNS (direct CLI and non-proxy UDP tools still use macOS system DNS).
                   {:else if activeGlossary === "blocks"}
-                    Trackers dropped before loading plus WebRTC STUN/TURN leak requests stopped before websites could discover your home IP.
+                    Trackers dropped before loading plus proxy-routed WebRTC STUN/TURN and SOCKS5 UDP probes stopped before revealing IPs.
                   {:else if activeGlossary === "decoys"}
-                    Fake background lookups sent with randomized timing while cycling TLS cipher profiles so advertisers see only noise.
+                    Fake background lookups sent with randomized timing while rotating cipher profiles across internal DoH/ODoH resolvers.
                   {:else if activeGlossary === "isp"}
-                    HTTPS handshakes split across multiple TLS records so ISP Deep Packet Inspection cannot read website hostnames.
+                    HTTPS handshakes split across multiple TLS records on :1080 to evade stateless single-packet ISP domain scanners.
                   {/if}
                 </span>
                 <button onclick={() => (activeGlossary = null)} class="text-zinc-400 hover:text-zinc-100 ml-4 shrink-0">Close</button>
@@ -779,14 +788,14 @@
                   on: status.odoh_enabled,
                   title: "Hide Site Lookups (Double-Blind DNS)",
                   tag: "RFC 9230 ODoH",
-                  desc: "Separates your IP address from the website name you look up across a relay and target so neither sees both."
+                  desc: "Separates your IP from proxied & internal domain lookups across an ODoH relay and target; automatically falls back to rotated DoH if a relay drops."
                 },
                 {
                   key: "sni",
                   on: status.sni_fragmentation,
                   title: "Hide Visited Websites From Your ISP",
-                  tag: "TLS Record Split",
-                  desc: "Breaks initial HTTPS website headers across tiny network frames so internet provider scanners cannot read domains."
+                  tag: "Anti-Single-Packet DPI",
+                  desc: "Splits initial HTTPS ClientHello headers across tiny TLS records on :1080 to bypass stateless single-packet ISP scanners (stateful DPI reassembly requires browser ECH or a VPN)."
                 },
                 {
                   key: "dns",
@@ -807,9 +816,9 @@
                 {
                   key: "ja3",
                   on: status.ja3_shuffle,
-                  title: "Disguise Browser Connection Signature",
-                  tag: "JA3/JA4 Shuffling",
-                  desc: "Rotates encryption cipher suite order and headers on outbound traffic to prevent passive fingerprinting."
+                  title: "Harden HTTP Headers & DoH Signatures",
+                  tag: "DoH TLS + HTTP Scrub",
+                  desc: "Rotates TLS cipher suites on internal ODoH/DoH & decoy queries and strips Proxy-Connection/X-Forwarded-For headers on plain HTTP (HTTPS browser ciphers pass through unchanged)."
                 }
               ] as item}
                 <div class="px-5 py-4 flex items-center justify-between gap-6">
@@ -843,7 +852,7 @@
                     <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/[0.04] text-zinc-400 border border-white/[0.06]">WebRTC Shield</span>
                   </div>
                   <p class="text-xs text-zinc-400 leading-relaxed">
-                    Blocks STUN/TURN leak probes (ports 3478, 5349, 19302) and SOCKS5 UDP bypasses so apps cannot discover your true home IP.
+                    Blocks STUN/TURN leak probes (ports 3478, 5349, 19302) and SOCKS5 UDP requests routed through :1080. For direct browser UDP defense, also disable non-proxied UDP in Chromium/Firefox.
                   </p>
                 </div>
                 <button
@@ -954,7 +963,7 @@
                   {/if}
                 </div>
                 <p class="text-xs text-zinc-400 max-w-md leading-relaxed">
-                  Tests real local proxy routing, double-blind ODoH DNS, WebRTC IP leak blocking, TLS record slicing, tracker sinkholing, and hardware sensors.
+                  Tests live proxy routing on :1080, ODoH DNS, proxy WebRTC blocking, TLS SNI record slicing, tracker sinkholing, and hardware sensors (transparently noting proxy vs OS scope).
                 </p>
                 {#if auditReport}
                   <div class="text-[11px] font-mono text-zinc-500 inline-flex items-center gap-1.5 pt-0.5">

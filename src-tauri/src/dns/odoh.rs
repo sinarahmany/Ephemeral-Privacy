@@ -138,13 +138,13 @@ impl OdohClient {
         Ok(contents)
     }
 
-    /// Executes an RFC 9230 Oblivious DoH DNS lookup through a non-colluding Relay -> Target pair.
-    pub async fn query_odoh(
+    /// Executes an RFC 9230 Oblivious DoH lookup against a single Relay -> Target route.
+    async fn query_odoh_route(
         &self,
+        route: &'static OdohRoute,
         raw_dns_packet: &[u8],
         ja3_shuffle: bool,
     ) -> Result<(Vec<u8>, &'static str), String> {
-        let route = self.next_route();
         let config_contents = self.get_target_config(route.target_host, ja3_shuffle).await?;
 
         // Build and HPKE-encrypt the query synchronously before any `.await` so ThreadRng is dropped cleanly
@@ -198,7 +198,31 @@ impl OdohClient {
             parse(&mut resp_bytes).map_err(|e| format!("Failed parsing ODoH response: {:?}", e))?;
         let response_dec = decrypt_response(&query_plaintext, &response_enc, cli_secret)
             .map_err(|e| format!("ODoH HPKE decryption failed: {:?}", e))?;
+        let msg = response_dec.into_msg().to_vec();
+        crate::dns::doh_pool::validate_dns_reply(&msg)?;
 
-        Ok((response_dec.into_msg().to_vec(), route.name))
+        Ok((msg, route.name))
+    }
+
+    /// Executes an RFC 9230 Oblivious DoH DNS lookup across available Relay -> Target pairs with failover.
+    pub async fn query_odoh(
+        &self,
+        raw_dns_packet: &[u8],
+        ja3_shuffle: bool,
+    ) -> Result<(Vec<u8>, &'static str), String> {
+        let start = self.rr_index.fetch_add(1, Ordering::Relaxed) % ODOH_ROUTES.len();
+        let mut last_err = String::new();
+
+        for offset in 0..ODOH_ROUTES.len() {
+            let route = &ODOH_ROUTES[(start + offset) % ODOH_ROUTES.len()];
+            match self.query_odoh_route(route, raw_dns_packet, ja3_shuffle).await {
+                Ok(res) => return Ok(res),
+                Err(e) => {
+                    last_err = e;
+                }
+            }
+        }
+
+        Err(last_err)
     }
 }

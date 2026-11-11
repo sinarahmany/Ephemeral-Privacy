@@ -372,12 +372,17 @@ mod macos {
     }
 
     fn is_apple_silicon_cam_active_ioreg() -> bool {
-        let Ok(out) = Command::new("ioreg").args(["-rn", "AppleH13CamIn"]).output() else {
-            return false;
-        };
-        let text = String::from_utf8_lossy(&out.stdout);
-        text.contains("\"FrontCameraActive\" = Yes")
-            || text.contains("\"FrontCameraStreaming\" = Yes")
+        for svc in ["AppleH13CamIn", "AppleH14CamIn", "AppleH15CamIn", "AppleH16CamIn"] {
+            if let Ok(out) = Command::new("ioreg").args(["-rn", svc]).output() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if text.contains("\"FrontCameraActive\" = Yes")
+                    || text.contains("\"FrontCameraStreaming\" = Yes")
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn resolve_pid_app_name(pid: &str) -> Option<String> {

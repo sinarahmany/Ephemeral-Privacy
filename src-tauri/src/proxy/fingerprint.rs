@@ -129,45 +129,82 @@ fn build_shuffled_tls_client(variant: usize, user_agent: &str) -> Result<Client,
         .map_err(|e| format!("Reqwest client build error: {}", e))
 }
 
-/// Normalizes identifying HTTP headers in plaintext HTTP requests forwarded through the proxy.
-pub fn normalize_http_request_headers(raw_http: &[u8]) -> Option<Vec<u8>> {
+fn strip_proxy_request_target(request_line: &str) -> String {
+    let mut parts = request_line.splitn(3, ' ');
+    let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next()) else {
+        return request_line.to_string();
+    };
+    if let Some(rest) = target
+        .strip_prefix("http://")
+        .or_else(|| target.strip_prefix("https://"))
+    {
+        let origin_path = match rest.find('/') {
+            Some(idx) => &rest[idx..],
+            None => "/",
+        };
+        return format!("{} {} {}", method, origin_path, version);
+    }
+    request_line.to_string()
+}
+
+/// Sanitizes forward-proxy HTTP request lines/headers, enforcing `Connection: close` so
+/// subsequent HTTP/1.1 keep-alive requests cannot smuggle trackers past proxy checks.
+pub fn rewrite_http_proxy_head(raw_http: &[u8], normalize_identity: bool) -> Option<Vec<u8>> {
     let text = std::str::from_utf8(raw_http).ok()?;
     let header_end = text.find("\r\n\r\n")?;
     let (headers_part, body_part) = text.split_at(header_end);
 
-    let mut rng = rand::rng();
-    let generic_ua = *GENERIC_USER_AGENTS.choose(&mut rng)?;
+    let generic_ua = if normalize_identity {
+        let mut rng = rand::rng();
+        Some(*GENERIC_USER_AGENTS.choose(&mut rng)?)
+    } else {
+        None
+    };
 
     let mut normalized_lines = Vec::new();
     let mut saw_ua = false;
 
     for (idx, line) in headers_part.split("\r\n").enumerate() {
         if idx == 0 {
-            normalized_lines.push(line.to_string());
+            normalized_lines.push(strip_proxy_request_target(line));
             continue;
         }
         let lower = line.to_ascii_lowercase();
-        if lower.starts_with("user-agent:") {
-            normalized_lines.push(format!("User-Agent: {}", generic_ua));
-            saw_ua = true;
-        } else if lower.starts_with("x-client-data:")
+        if lower.starts_with("proxy-connection:")
+            || lower.starts_with("connection:")
             || lower.starts_with("x-forwarded-for:")
             || lower.starts_with("via:")
         {
-            // Strip client fingerprinting / proxy chain hints
             continue;
+        } else if normalize_identity && lower.starts_with("x-client-data:") {
+            continue;
+        } else if lower.starts_with("user-agent:") {
+            if let Some(ua) = generic_ua {
+                normalized_lines.push(format!("User-Agent: {}", ua));
+                saw_ua = true;
+            } else {
+                normalized_lines.push(line.to_string());
+            }
         } else {
             normalized_lines.push(line.to_string());
         }
     }
 
-    if !saw_ua {
-        normalized_lines.push(format!("User-Agent: {}", generic_ua));
+    if let Some(ua) = generic_ua {
+        if !saw_ua {
+            normalized_lines.push(format!("User-Agent: {}", ua));
+        }
     }
+    normalized_lines.push("Connection: close".to_string());
 
     let mut out = normalized_lines.join("\r\n").into_bytes();
     out.extend_from_slice(body_part.as_bytes());
     Some(out)
+}
+
+/// Normalizes identifying HTTP headers in plaintext HTTP requests forwarded through the proxy.
+pub fn normalize_http_request_headers(raw_http: &[u8]) -> Option<Vec<u8>> {
+    rewrite_http_proxy_head(raw_http, true)
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@ use crate::proxy::fingerprint::FingerprintPool;
 use rand::seq::IndexedRandom;
 use reqwest::Client;
 use simple_dns::rdata::RData;
-use simple_dns::{Name, Packet, Question, CLASS, QCLASS, QTYPE, TYPE};
+use simple_dns::{Name, Packet, PacketFlag, Question, CLASS, QCLASS, QTYPE, RCODE, TYPE};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -74,6 +74,18 @@ pub struct DohPool {
     pub fp_pool: FingerprintPool,
     pub odoh: OdohClient,
     rr_index: Arc<AtomicUsize>,
+}
+
+/// Validates that a raw DNS wire response parses cleanly and is not a resolver error
+/// (`SERVFAIL`, `REFUSED`, `FORMERR`, or `NOTIMP`). `NXDOMAIN` is treated as a valid answer.
+pub(crate) fn validate_dns_reply(resp_bytes: &[u8]) -> Result<(), String> {
+    let parsed = Packet::parse(resp_bytes).map_err(|e| format!("Invalid DNS packet: {}", e))?;
+    match parsed.rcode() {
+        RCODE::FormatError | RCODE::ServerFailure | RCODE::NotImplemented | RCODE::Refused => {
+            Err(format!("Upstream DNS returned {:?}", parsed.rcode()))
+        }
+        _ => Ok(()),
+    }
 }
 
 impl DohPool {
@@ -157,7 +169,7 @@ impl DohPool {
     }
 
     /// Smart DNS query: attempts RFC 9230 Oblivious DoH Relay first when `use_odoh` is enabled,
-    /// seamlessly falling back to direct rotated DoH if relay is unreachable.
+    /// seamlessly falling back across rotated DoH upstreams if relays are unreachable or error out.
     /// Returns `(response_bytes, used_odoh, route_or_resolver_name)`.
     pub async fn query_dns_smart(
         &self,
@@ -176,32 +188,38 @@ impl DohPool {
             }
         }
 
-        let resolver = self.next_resolver();
-        let resp = self
-            .query_doh_profiled(raw_dns_packet, resolver, ja3_shuffle)
-            .await?;
-        Ok((resp, false, resolver.name))
+        let start = self.rr_index.fetch_add(1, Ordering::Relaxed) % RESOLVERS.len();
+        let mut last_err = String::from("No DoH resolvers configured");
+        for offset in 0..RESOLVERS.len() {
+            let resolver = &RESOLVERS[(start + offset) % RESOLVERS.len()];
+            match self
+                .query_doh_profiled(raw_dns_packet, resolver, ja3_shuffle)
+                .await
+            {
+                Ok(resp) => match validate_dns_reply(&resp) {
+                    Ok(()) => return Ok((resp, false, resolver.name)),
+                    Err(e) => last_err = format!("{}: {}", resolver.name, e),
+                },
+                Err(e) => last_err = e,
+            }
+        }
+        Err(last_err)
     }
 
-    /// Performs encrypted DNS resolution (ODoH Relay when enabled, rotated DoH fallback)
-    /// while optionally enforcing real-time CNAME cloaked tracker inspection.
-    pub async fn resolve_ip_verified(
+    async fn query_record_ips_verified(
         &self,
-        domain: &str,
+        clean: &str,
+        qtype: TYPE,
         use_odoh: bool,
         ja3_shuffle: bool,
         block_trackers: bool,
-    ) -> Result<(IpAddr, bool, &'static str), ResolveError> {
-        let clean = domain.trim_end_matches('.');
-        if let Ok(ip) = clean.parse::<IpAddr>() {
-            return Ok((ip, false, "Direct IP"));
-        }
-
+    ) -> Result<(Vec<IpAddr>, bool, &'static str), ResolveError> {
         let name = Name::new(clean).map_err(|e| ResolveError::Failed(e.to_string()))?;
         let mut query = Packet::new_query(rand::random());
+        query.set_flags(PacketFlag::RECURSION_DESIRED);
         query.questions.push(Question::new(
             name,
-            QTYPE::TYPE(TYPE::A),
+            QTYPE::TYPE(qtype),
             QCLASS::CLASS(CLASS::IN),
             false,
         ));
@@ -237,28 +255,67 @@ impl DohPool {
         }
 
         let parsed = Packet::parse(&resp_bytes).map_err(|e| ResolveError::Failed(e.to_string()))?;
-
+        let mut ips = Vec::new();
         for ans in &parsed.answers {
             match &ans.rdata {
-                RData::A(a) => {
-                    return Ok((
-                        IpAddr::V4(std::net::Ipv4Addr::from(a.address)),
-                        used_odoh,
-                        route_name,
-                    ));
-                }
-                RData::AAAA(aaaa) => {
-                    return Ok((
-                        IpAddr::V6(std::net::Ipv6Addr::from(aaaa.address)),
-                        used_odoh,
-                        route_name,
-                    ));
-                }
+                RData::A(a) => ips.push(IpAddr::V4(std::net::Ipv4Addr::from(a.address))),
+                RData::AAAA(aaaa) => ips.push(IpAddr::V6(std::net::Ipv6Addr::from(aaaa.address))),
                 _ => {}
             }
         }
 
-        Err(ResolveError::Failed(format!("No IP address found for {}", clean)))
+        Ok((ips, used_odoh, route_name))
+    }
+
+    /// Resolves all A and fallback AAAA IPs via ODoH/DoH while enforcing real-time CNAME tracker inspection.
+    pub async fn resolve_ips_verified(
+        &self,
+        domain: &str,
+        use_odoh: bool,
+        ja3_shuffle: bool,
+        block_trackers: bool,
+    ) -> Result<(Vec<IpAddr>, bool, &'static str), ResolveError> {
+        let clean = domain.trim_end_matches('.');
+        if let Ok(ip) = clean.parse::<IpAddr>() {
+            return Ok((vec![ip], false, "Direct IP"));
+        }
+
+        let (mut ips, mut used_odoh, mut route_name) = self
+            .query_record_ips_verified(clean, TYPE::A, use_odoh, ja3_shuffle, block_trackers)
+            .await?;
+
+        if ips.is_empty() {
+            if let Ok((v6_ips, v6_odoh, v6_route)) = self
+                .query_record_ips_verified(clean, TYPE::AAAA, use_odoh, ja3_shuffle, block_trackers)
+                .await
+            {
+                if !v6_ips.is_empty() {
+                    ips = v6_ips;
+                    used_odoh = v6_odoh;
+                    route_name = v6_route;
+                }
+            }
+        }
+
+        if ips.is_empty() {
+            return Err(ResolveError::Failed(format!("No IP address found for {}", clean)));
+        }
+
+        Ok((ips, used_odoh, route_name))
+    }
+
+    /// Performs encrypted DNS resolution returning first IP with optional CNAME tracker blocking.
+    pub async fn resolve_ip_verified(
+        &self,
+        domain: &str,
+        use_odoh: bool,
+        ja3_shuffle: bool,
+        block_trackers: bool,
+    ) -> Result<(IpAddr, bool, &'static str), ResolveError> {
+        let (ips, used_odoh, route_name) = self
+            .resolve_ips_verified(domain, use_odoh, ja3_shuffle, block_trackers)
+            .await?;
+        Ok((ips[0], used_odoh, route_name))
     }
 
     /// Performs encrypted DNS resolution (ODoH Relay when enabled, rotated DoH fallback)

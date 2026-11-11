@@ -235,10 +235,18 @@ fn dynamic_blocklist() -> &'static std::sync::RwLock<std::collections::HashSet<S
     DYNAMIC_BLOCKLIST.get_or_init(|| std::sync::RwLock::new(std::collections::HashSet::new()))
 }
 
+static UNIQUE_STATIC_RULE_COUNT: LazyLock<usize> = LazyLock::new(|| {
+    let mut uniq = std::collections::HashSet::with_capacity(
+        TRACKER_PATTERNS.len() + EXTRA_TRACKER_PATTERNS.len(),
+    );
+    for &p in TRACKER_PATTERNS.iter().chain(EXTRA_TRACKER_PATTERNS.iter()) {
+        uniq.insert(p);
+    }
+    uniq.len()
+});
+
 pub fn total_blocklist_rules() -> usize {
-    TRACKER_PATTERNS.len()
-        + EXTRA_TRACKER_PATTERNS.len()
-        + DYNAMIC_RULE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    *UNIQUE_STATIC_RULE_COUNT + DYNAMIC_RULE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn match_static_ac<'a>(

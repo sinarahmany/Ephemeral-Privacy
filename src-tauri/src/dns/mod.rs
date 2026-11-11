@@ -53,10 +53,6 @@ impl DnsServer {
                             }
                         };
 
-                        if !self.state.dns_enabled.load(Ordering::Relaxed) {
-                            continue;
-                        }
-
                         let query_bytes = buf[..len].to_vec();
                         let socket_clone = socket.clone();
                         let state = self.state.clone();
@@ -126,22 +122,26 @@ async fn handle_dns_query(
         }
     }
 
-    // 2. Direct Sinkhole Tracker Check
-    if let Some(tracker_name) = match_tracker(clean_domain) {
-        state.trackers_blocked.fetch_add(1, Ordering::Relaxed);
-        state
-            .log_event(
-                "TRACKER_BLOCKED",
-                &format!("Ad/Tracker Sinkholed: {}", tracker_name),
-                &format!("Intercepted and blocked DNS request for {}", clean_domain),
-                clean_domain,
-            )
-            .await;
+    let block_ads = state.dns_enabled.load(Ordering::Relaxed);
 
-        if let Some(sinkhole_resp) = build_sinkhole_response(&query_bytes) {
-            let _ = socket.send_to(&sinkhole_resp, client_addr).await;
+    // 2. Direct Sinkhole Tracker Check (skipped when Ad/Tracker blocker is toggled OFF)
+    if block_ads {
+        if let Some(tracker_name) = match_tracker(clean_domain) {
+            state.trackers_blocked.fetch_add(1, Ordering::Relaxed);
+            state
+                .log_event(
+                    "TRACKER_BLOCKED",
+                    &format!("Ad/Tracker Sinkholed: {}", tracker_name),
+                    &format!("Intercepted and blocked DNS request for {}", clean_domain),
+                    clean_domain,
+                )
+                .await;
+
+            if let Some(sinkhole_resp) = build_sinkhole_response(&query_bytes) {
+                let _ = socket.send_to(&sinkhole_resp, client_addr).await;
+            }
+            return;
         }
-        return;
     }
 
     // 3. Legitimate query: Record metrics and trigger Ephemeral Chaff Decoy burst!
@@ -154,6 +154,9 @@ async fn handle_dns_query(
     // 4. Forward via ODoH Relay (when enabled) or Encrypted DoH Pool
     match doh_pool.query_dns_smart(&query_bytes, use_odoh, ja3_shuffle).await {
         Ok((resp_bytes, used_odoh, route_name)) => {
+            state
+                .odoh_fallback_active
+                .store(use_odoh && !used_odoh, Ordering::Relaxed);
             if used_odoh {
                 state.odoh_queries_relayed.fetch_add(1, Ordering::Relaxed);
             }
@@ -161,28 +164,30 @@ async fn handle_dns_query(
                 state.ja3_fingerprints_shuffled.fetch_add(1, Ordering::Relaxed);
             }
 
-            // 5. Inspect response for CNAME Cloaking
-            if let Some(cname_res) = inspect_cname_response(&resp_bytes) {
-                if cname_res.is_cloaked_tracker {
-                    state.trackers_blocked.fetch_add(1, Ordering::Relaxed);
-                    state
-                        .log_event(
-                            "TRACKER_BLOCKED",
-                            "CNAME Cloaked Tracker Unmasked & Blocked",
-                            &format!(
-                                "Domain '{}' cloaked target '{}' ({})",
-                                cname_res.original_domain,
-                                cname_res.canonical_target.as_deref().unwrap_or(""),
-                                cname_res.matched_tracker.unwrap_or("")
-                            ),
-                            &clean_domain,
-                        )
-                        .await;
+            // 5. Inspect response for CNAME Cloaking (only when ad/tracker blocking is enabled)
+            if block_ads {
+                if let Some(cname_res) = inspect_cname_response(&resp_bytes) {
+                    if cname_res.is_cloaked_tracker {
+                        state.trackers_blocked.fetch_add(1, Ordering::Relaxed);
+                        state
+                            .log_event(
+                                "TRACKER_BLOCKED",
+                                "CNAME Cloaked Tracker Unmasked & Blocked",
+                                &format!(
+                                    "Domain '{}' cloaked target '{}' ({})",
+                                    cname_res.original_domain,
+                                    cname_res.canonical_target.as_deref().unwrap_or(""),
+                                    cname_res.matched_tracker.unwrap_or("")
+                                ),
+                                &clean_domain,
+                            )
+                            .await;
 
-                    if let Some(sinkhole_resp) = build_sinkhole_response(&query_bytes) {
-                        let _ = socket.send_to(&sinkhole_resp, client_addr).await;
+                        if let Some(sinkhole_resp) = build_sinkhole_response(&query_bytes) {
+                            let _ = socket.send_to(&sinkhole_resp, client_addr).await;
+                        }
+                        return;
                     }
-                    return;
                 }
             }
 

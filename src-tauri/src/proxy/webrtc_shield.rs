@@ -20,6 +20,11 @@ static STUN_TURN_DOMAINS: &[&str] = &[
     "stun.voxgratia.org",
     "stun.sipgate.net",
     "stun.freeswitch.org",
+    "global.turn.twilio.com",
+    "turn.twilio.com",
+    "relay.twilio.com",
+    "xirsys.com",
+    "turn.xirsys.com",
 ];
 
 /// Standard STUN / TURN / ICE discovery ports
@@ -58,8 +63,12 @@ pub fn is_webrtc_stun_target(host: &str, port: Option<u16>) -> Option<&'static s
 
     if clean.starts_with("stun.")
         || clean.starts_with("turn.")
+        || clean.starts_with("stun0")
+        || clean.starts_with("turn0")
         || clean.contains(".stun.")
         || clean.contains(".turn.")
+        || clean.contains("turnserver")
+        || clean.contains("stunserver")
         || clean.starts_with("stun-")
         || clean.starts_with("turn-")
     {

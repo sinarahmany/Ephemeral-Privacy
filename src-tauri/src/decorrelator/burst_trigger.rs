@@ -2,7 +2,7 @@ use crate::decorrelator::grammar::{random_decoy_search_url, random_dns_domain};
 use crate::dns::doh_pool::DohPool;
 use crate::state::{AppState, ChaffIntensity};
 use rand::RngExt;
-use simple_dns::{Name, Packet, Question, CLASS, QTYPE, TYPE};
+use simple_dns::{Name, Packet, PacketFlag, Question, CLASS, QTYPE, TYPE};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,9 +50,10 @@ impl DecorrelatorEngine {
                 // Rotate to a different upstream resolver for each decoy query!
                 let resolver = doh_pool.random_resolver(None);
 
-                // Build a valid raw DNS wire-format packet
+                // Build a valid raw DNS wire-format packet with RD=1 like standard client resolvers
                 if let Ok(name) = Name::new(decoy_domain) {
                     let mut packet = Packet::new_query(rand::rng().random());
+                    packet.set_flags(PacketFlag::RECURSION_DESIRED);
                     packet.questions.push(Question::new(
                         name,
                         QTYPE::TYPE(TYPE::A),

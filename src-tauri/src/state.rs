@@ -39,6 +39,11 @@ pub struct PrivacyMetrics {
     pub ja3_fingerprints_shuffled: u64,
     pub hardware_alerts_count: u64,
     pub blocklist_rules: u64,
+    pub camera_active: bool,
+    pub mic_active: bool,
+    pub camera_apps: Vec<String>,
+    pub mic_apps: Vec<String>,
+    pub odoh_fallback_active: bool,
 }
 
 pub struct AppState {
@@ -73,6 +78,7 @@ pub struct AppState {
     pub ja3_fingerprints_shuffled: AtomicU64,
     pub hardware_alerts_count: AtomicU64,
     pub blocklist_rules: AtomicU64,
+    pub odoh_fallback_active: AtomicBool,
 
     // Event counter & Circular Log Buffer (max 50 items, strictly RAM)
     pub event_sequence: AtomicU64,
@@ -111,6 +117,7 @@ impl AppState {
             ja3_fingerprints_shuffled: AtomicU64::new(0),
             hardware_alerts_count: AtomicU64::new(0),
             blocklist_rules: AtomicU64::new(crate::dns::sinkhole::total_blocklist_rules() as u64),
+            odoh_fallback_active: AtomicBool::new(false),
 
             event_sequence: AtomicU64::new(0),
             recent_events: Arc::new(RwLock::new(VecDeque::with_capacity(60))),
@@ -140,7 +147,9 @@ impl AppState {
         events.push_front(event);
     }
 
-    pub fn get_metrics(&self) -> PrivacyMetrics {
+    pub async fn get_metrics(&self) -> PrivacyMetrics {
+        let camera_apps = self.camera_apps.read().await.clone();
+        let mic_apps = self.mic_apps.read().await.clone();
         PrivacyMetrics {
             queries_intercepted: self.queries_intercepted.load(Ordering::Relaxed),
             chaff_queries_sent: self.chaff_queries_sent.load(Ordering::Relaxed),
@@ -152,6 +161,11 @@ impl AppState {
             ja3_fingerprints_shuffled: self.ja3_fingerprints_shuffled.load(Ordering::Relaxed),
             hardware_alerts_count: self.hardware_alerts_count.load(Ordering::Relaxed),
             blocklist_rules: self.blocklist_rules.load(Ordering::Relaxed),
+            camera_active: self.camera_active.load(Ordering::Relaxed),
+            mic_active: self.mic_active.load(Ordering::Relaxed),
+            camera_apps,
+            mic_apps,
+            odoh_fallback_active: self.odoh_fallback_active.load(Ordering::Relaxed),
         }
     }
 }

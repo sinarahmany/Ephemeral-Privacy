@@ -6,7 +6,7 @@ use tauri_app_lib::dns::doh_pool::DohPool;
 use tauri_app_lib::dns::DnsServer;
 use tauri_app_lib::proxy::ProxyServer;
 use tauri_app_lib::state::AppState;
-use simple_dns::{Name, Packet, Question, CLASS, QTYPE, TYPE};
+use simple_dns::{Name, Packet, PacketFlag, Question, CLASS, QTYPE, TYPE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
@@ -23,6 +23,7 @@ async fn main() {
     // TEST 1: DoH Pool directly
     println!("\n[1/6] Testing Upstream DoH Resolvers directly...");
     let mut query = Packet::new_query(1001);
+    query.set_flags(PacketFlag::RECURSION_DESIRED);
     query.questions.push(Question::new(
         Name::new("example.com").unwrap(),
         QTYPE::TYPE(TYPE::A),
@@ -65,6 +66,7 @@ async fn main() {
     // TEST 3: DNS Sinkhole Block test (tracking domain)
     println!("\n[3/6] Testing Tracker Sinkhole (adservice.google.com)...");
     let mut ad_query = Packet::new_query(1002);
+    ad_query.set_flags(PacketFlag::RECURSION_DESIRED);
     ad_query.questions.push(Question::new(
         Name::new("adservice.google.com").unwrap(),
         QTYPE::TYPE(TYPE::A),

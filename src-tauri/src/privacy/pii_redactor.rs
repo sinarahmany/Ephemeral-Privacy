@@ -54,57 +54,87 @@ pub struct RedactionResult {
     pub token_map: HashMap<String, String>,
 }
 
+fn redact_pass<F>(
+    input: &str,
+    re: &Regex,
+    prefix: &str,
+    mut validator: F,
+    token_map: &mut HashMap<String, String>,
+    reverse_map: &mut HashMap<String, String>,
+    redactions_count: &mut usize,
+) -> String
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut out = String::with_capacity(input.len());
+    let mut last = 0;
+    let mut idx = 1usize;
+
+    for mat in re.find_iter(input) {
+        let matched = mat.as_str();
+        if !validator(matched) {
+            continue;
+        }
+        out.push_str(&input[last..mat.start()]);
+        let token = if let Some(existing) = reverse_map.get(matched) {
+            existing.clone()
+        } else {
+            let tok = format!("<{}_{}>", prefix, idx);
+            idx += 1;
+            token_map.insert(tok.clone(), matched.to_string());
+            reverse_map.insert(matched.to_string(), tok.clone());
+            *redactions_count += 1;
+            tok
+        };
+        out.push_str(&token);
+        last = mat.end();
+    }
+    out.push_str(&input[last..]);
+    out
+}
+
 /// Redacts sensitive PII and API keys from a prompt, generating reversible semantic tokens
 pub fn redact_pii(text: &str) -> RedactionResult {
-    let mut current = text.to_string();
     let mut token_map = HashMap::new();
+    let mut reverse_map = HashMap::new();
     let mut redactions_count = 0;
 
-    // 1. API Keys & Secrets
-    let mut api_idx = 1;
-    for mat in API_KEY_REGEX.find_iter(text) {
-        let key_str = mat.as_str().to_string();
-        let token = format!("<API_KEY_{}>", api_idx);
-        token_map.insert(token.clone(), key_str.clone());
-        current = current.replace(&key_str, &token);
-        api_idx += 1;
-        redactions_count += 1;
-    }
-
-    // 2. Credit Cards (Luhn verified)
-    let mut cc_idx = 1;
-    for mat in CC_REGEX.find_iter(text) {
-        let cc_str = mat.as_str().to_string();
-        if luhn_check(&cc_str) {
-            let token = format!("<CREDIT_CARD_{}>", cc_idx);
-            token_map.insert(token.clone(), cc_str.clone());
-            current = current.replace(&cc_str, &token);
-            cc_idx += 1;
-            redactions_count += 1;
-        }
-    }
-
-    // 3. Email Addresses
-    let mut email_idx = 1;
-    for mat in EMAIL_REGEX.find_iter(text) {
-        let email_str = mat.as_str().to_string();
-        let token = format!("<EMAIL_{}>", email_idx);
-        token_map.insert(token.clone(), email_str.clone());
-        current = current.replace(&email_str, &token);
-        email_idx += 1;
-        redactions_count += 1;
-    }
-
-    // 4. Phone Numbers
-    let mut phone_idx = 1;
-    for mat in PHONE_REGEX.find_iter(text) {
-        let phone_str = mat.as_str().to_string();
-        let token = format!("<PHONE_{}>", phone_idx);
-        token_map.insert(token.clone(), phone_str.clone());
-        current = current.replace(&phone_str, &token);
-        phone_idx += 1;
-        redactions_count += 1;
-    }
+    let current = redact_pass(
+        text,
+        &API_KEY_REGEX,
+        "API_KEY",
+        |_| true,
+        &mut token_map,
+        &mut reverse_map,
+        &mut redactions_count,
+    );
+    let current = redact_pass(
+        &current,
+        &CC_REGEX,
+        "CREDIT_CARD",
+        luhn_check,
+        &mut token_map,
+        &mut reverse_map,
+        &mut redactions_count,
+    );
+    let current = redact_pass(
+        &current,
+        &EMAIL_REGEX,
+        "EMAIL",
+        |_| true,
+        &mut token_map,
+        &mut reverse_map,
+        &mut redactions_count,
+    );
+    let current = redact_pass(
+        &current,
+        &PHONE_REGEX,
+        "PHONE",
+        |_| true,
+        &mut token_map,
+        &mut reverse_map,
+        &mut redactions_count,
+    );
 
     RedactionResult {
         sanitized_text: current,
@@ -154,5 +184,16 @@ mod tests {
         let res = redact_pii(&text);
         assert!(res.sanitized_text.contains("<CREDIT_CARD_1>"));
         assert!(!res.sanitized_text.contains("4532"));
+    }
+
+    #[test]
+    fn test_no_overlap_between_api_keys_and_phones_and_duplicates_reused() {
+        let prompt = "Key sk-proj-800-555-1212-abcdef123456 email a@b.com twice: a@b.com.";
+        let res = redact_pii(prompt);
+        assert_eq!(res.redactions_count, 2);
+        assert!(res.sanitized_text.contains("<API_KEY_1>"));
+        assert!(!res.sanitized_text.contains("<PHONE_1>"));
+        assert_eq!(res.sanitized_text.matches("<EMAIL_1>").count(), 2);
+        assert_eq!(restore_pii(&res.sanitized_text, &res.token_map), prompt);
     }
 }

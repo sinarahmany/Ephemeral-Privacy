@@ -54,6 +54,17 @@ pub static TRACKING_PARAMS: &[&str] = &[
     "_branch_match_id",
     "_bta_tid",
     "_bta_c",
+    "igsh",
+    "srsltid",
+    "gad_source",
+    "gad_campaignid",
+    "mc_cid",
+    "_gl",
+    "epik",
+    "sccid",
+    "s_kwcid",
+    "fb_action_ids",
+    "fb_action_types",
 ];
 
 static URL_FINDER: LazyLock<Regex> = LazyLock::new(|| {
@@ -94,28 +105,42 @@ pub fn sanitize_url(raw: &str) -> Option<String> {
         return None;
     }
 
-    parsed.query_pairs_mut().clear().extend_pairs(retained);
+    if retained.is_empty() {
+        parsed.set_query(None);
+    } else {
+        parsed.query_pairs_mut().clear().extend_pairs(retained);
+    }
     Some(parsed.to_string())
 }
 
 /// Sanitizes any URLs found in arbitrary copied text (whether solitary or within sentences)
 pub fn sanitize_text_content(text: &str) -> Option<String> {
     let mut modified = false;
-    let mut result = text.to_string();
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
 
     for mat in URL_FINDER.find_iter(text) {
-        let matched_url = mat.as_str();
-        if let Some(cleaned_url) = sanitize_url(matched_url) {
-            result = result.replace(matched_url, &cleaned_url);
+        result.push_str(&text[last_end..mat.start()]);
+        let raw_match = mat.as_str();
+        let trimmed_url = raw_match.trim_end_matches(|c: char| ".,;:!?)\"'>]".contains(c));
+        let trailing_punct = &raw_match[trimmed_url.len()..];
+
+        if let Some(cleaned_url) = sanitize_url(trimmed_url) {
+            result.push_str(&cleaned_url);
+            result.push_str(trailing_punct);
             modified = true;
+        } else {
+            result.push_str(raw_match);
         }
+        last_end = mat.end();
     }
 
-    if modified {
-        Some(result)
-    } else {
-        None
+    if !modified {
+        return None;
     }
+
+    result.push_str(&text[last_end..]);
+    Some(result)
 }
 
 /// Background loop monitoring system clipboard for tracking URLs
@@ -196,5 +221,16 @@ mod tests {
         let text = "Check out this deal: https://store.com/item?id=1&gclid=xyz_tracking on sale!";
         let cleaned = sanitize_text_content(text).unwrap();
         assert_eq!(cleaned, "Check out this deal: https://store.com/item?id=1 on sale!");
+
+        // Strip trailing tracking-only query cleanly without leaving trailing `?`, and preserve sentence period
+        let all_stripped = "See https://example.com/?utm_source=fbclid.";
+        assert_eq!(
+            sanitize_text_content(all_stripped).unwrap(),
+            "See https://example.com/."
+        );
+        assert_eq!(
+            sanitize_url("https://example.com/path?igsh=abc123").as_deref(),
+            Some("https://example.com/path")
+        );
     }
 }

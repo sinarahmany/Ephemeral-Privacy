@@ -132,8 +132,8 @@ pub async fn run_full_privacy_audit(
             (
                 "PASS",
                 20,
-                "System traffic is routed cleanly through the local privacy shield (127.0.0.1:1080).",
-                "OS network service HTTP/HTTPS/SOCKS proxy active for 127.0.0.1:1080; local proxy accepting connections.".to_string(),
+                "System HTTP/HTTPS/SOCKS traffic is routed through 127.0.0.1:1080 (direct CLI/UDP tools still bypass OS proxy unless configured individually).",
+                "OS network service HTTP/HTTPS/SOCKS proxy active for 127.0.0.1:1080; local proxy accepting connections (macOS system DNS remains untouched).".to_string(),
             )
         } else if listener_alive {
             (
@@ -174,41 +174,44 @@ pub async fn run_full_privacy_audit(
         let start = Instant::now();
         let odoh_enabled = state.odoh_enabled.load(Ordering::Relaxed);
         let ja3 = state.ja3_shuffle.load(Ordering::Relaxed);
-        let dns_enabled = state.dns_enabled.load(Ordering::Relaxed);
 
         let res = doh_pool
-            .resolve_ip_smart("cloudflare.com", odoh_enabled, ja3)
+            .resolve_ips_verified("cloudflare.com", odoh_enabled, ja3, false)
             .await;
 
         let (status, pts, summary, proof) = match res {
-            Ok((ip, used_odoh, route_label)) if dns_enabled && odoh_enabled && used_odoh => (
-                "PASS",
-                20,
-                "DNS queries are HPKE-encrypted and cryptographically separated via a blind ODoH Relay.",
-                format!(
-                    "Live ODoH query for cloudflare.com succeeded via {} -> {} (Relay blind to query, Target blind to client IP).",
-                    route_label, ip
-                ),
-            ),
-            Ok((ip, used_odoh, route_label)) if dns_enabled => (
-                "WARN",
-                12,
-                if odoh_enabled {
-                    "ODoH Relay temporarily fell back to standard encrypted DoH (still hidden from ISP)."
-                } else {
-                    "Encrypted DoH is active, but Oblivious DoH (ODoH) Relay Mode is switched OFF."
-                },
-                format!(
-                    "cloudflare.com resolved via {} -> {} (used_odoh={}, odoh_enabled={}).",
-                    route_label, ip, used_odoh, odoh_enabled
-                ),
-            ),
-            Ok((ip, _, route_label)) => (
-                "WARN",
-                8,
-                "DNS encryption engine responded, but the Encrypted DNS toggle is currently OFF.",
-                format!("Direct probe {} -> {} while dns_enabled=false.", route_label, ip),
-            ),
+            Ok((ips, used_odoh, route_label)) if odoh_enabled && used_odoh => {
+                state.odoh_fallback_active.store(false, Ordering::Relaxed);
+                let sample_ips: Vec<String> = ips.iter().take(2).map(|ip| ip.to_string()).collect();
+                (
+                    "PASS",
+                    20,
+                    "Proxy & daemon DNS lookups are HPKE-encrypted via a blind ODoH Relay (Relay sees IP, Target sees domain).",
+                    format!(
+                        "Live ODoH query for cloudflare.com succeeded via {} -> {:?} (A/AAAA dual-stack; direct OS UDP/53 CLI apps still use system DNS).",
+                        route_label, sample_ips
+                    ),
+                )
+            }
+            Ok((ips, used_odoh, route_label)) => {
+                state
+                    .odoh_fallback_active
+                    .store(odoh_enabled, Ordering::Relaxed);
+                let sample_ips: Vec<String> = ips.iter().take(2).map(|ip| ip.to_string()).collect();
+                (
+                    "WARN",
+                    12,
+                    if odoh_enabled {
+                        "ODoH Relay temporarily fell back to standard encrypted DoH (ISP still cannot read proxied queries)."
+                    } else {
+                        "Encrypted DoH is active for proxied traffic, but Oblivious DoH (ODoH) Relay Mode is switched OFF."
+                    },
+                    format!(
+                        "cloudflare.com resolved via {} -> {:?} (used_odoh={}, odoh_enabled={}, odoh_fallback_active={}).",
+                        route_label, sample_ips, used_odoh, odoh_enabled, odoh_enabled
+                    ),
+                )
+            }
             Err(e) => (
                 "FAIL",
                 0,
@@ -240,9 +243,9 @@ pub async fn run_full_privacy_audit(
             Ok(ref line) if webrtc_enabled && line.contains("403") => (
                 "PASS",
                 20,
-                "WebRTC STUN/TURN leak attempts are intercepted locally before discovering your real IP.",
+                "Proxy-routed WebRTC STUN/TURN and SOCKS5 UDP probes are blocked on :1080. For full defense against direct browser UDP leaks, enable 'Disable non-proxied UDP' in browser settings.",
                 format!(
-                    "Live CONNECT stun.l.google.com:19302 -> '{}' (rule match: {:?}).",
+                    "Live CONNECT stun.l.google.com:19302 -> '{}' (rule match: {:?}; direct OS raw UDP sockets outside SOCKS5 require browser UDP restriction or VPN/TUN).",
                     line, static_match
                 ),
             ),
@@ -309,30 +312,35 @@ pub async fn run_full_privacy_audit(
             (true, true) => (
                 "PASS",
                 15,
-                "TLS ClientHello record splitting and JA3/JA4 cipher profile rotation are active and intact.",
+                "TLS ClientHello record splitting (anti-stateless DPI) is intact for HTTPS tunnels; internal DoH/Chaff cipher rotation and plain-HTTP header scrubbing are active.",
             ),
-            (true, false) | (false, true) => (
+            (true, false) => (
                 "WARN",
-                8,
-                "Only one TLS obfuscation layer is active (enable both SNI Slicing and JA3 Shuffling for full protection).",
+                10,
+                "TLS SNI record splitting is active against single-packet DPI, while internal DoH/Chaff cipher shuffling & HTTP header sanitization are OFF.",
+            ),
+            (false, true) => (
+                "WARN",
+                5,
+                "Internal DoH/Chaff cipher rotation & HTTP header scrubbing are active, but SNI Record Splitting is OFF (initial TLS ClientHello contains visible SNI).",
             ),
             _ => (
                 "FAIL",
                 0,
-                "Both TLS SNI record splitting and JA3/JA4 cipher shuffling are turned OFF.",
+                "Both TLS SNI record splitting and internal cipher shuffling / HTTP header scrubbing are OFF.",
             ),
         };
 
         checks.push(AuditCheckResult {
             id: "tls_sni_ja3_shuffling".into(),
-            name: "TLS SNI Blinding & JA3 Shuffling".into(),
+            name: "TLS SNI Blinding & Header Hardening".into(),
             status: status.into(),
             points_earned: pts,
             max_points: 15,
             latency_ms: start.elapsed().as_millis() as u64,
             summary: summary.into(),
             proof: format!(
-                "SNI byte offset={:?}, split ClientHello into {} RFC-compliant TLS records (reassembly intact={}), JA3 pool shuffling={} (4 cipher/ALPN profiles).",
+                "SNI offset={:?}, split={} RFC records (reassembly={}; defeats single-packet DPI, stateful DPI/ECH unaffected without MITM). Internal DoH/Chaff JA3 rotation & HTTP header scrubbing={} (browser HTTPS ciphers pass through unmodified).",
                 sni_pos, rec_count, integrity_ok, ja3_enabled
             ),
         });

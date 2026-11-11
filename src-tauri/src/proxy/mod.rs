@@ -7,7 +7,7 @@ use crate::decorrelator::DecorrelatorEngine;
 use crate::dns::doh_pool::DohPool;
 use crate::dns::sinkhole::match_tracker;
 use crate::proxy::dpi_bypass::send_obfuscated_client_hello;
-use crate::proxy::fingerprint::normalize_http_request_headers;
+use crate::proxy::fingerprint::rewrite_http_proxy_head;
 use crate::proxy::webrtc_shield::is_webrtc_stun_target;
 use crate::state::AppState;
 use std::net::SocketAddr;
@@ -15,6 +15,42 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::Duration;
+
+fn parse_host_port(authority: &str, default_port: u16) -> (&str, u16) {
+    let trimmed = authority.trim();
+    if let Some(after_open) = trimmed.strip_prefix('[') {
+        if let Some((ip_part, rest)) = after_open.split_once(']') {
+            if let Some(port_str) = rest.strip_prefix(':') {
+                return (ip_part, port_str.parse::<u16>().unwrap_or(default_port));
+            }
+            return (ip_part, default_port);
+        }
+    }
+    if let Some((host, port_str)) = trimmed.rsplit_once(':') {
+        if !host.contains(':') {
+            return (host, port_str.parse::<u16>().unwrap_or(default_port));
+        }
+    }
+    (trimmed, default_port)
+}
+
+async fn relay_bidirectional(client_stream: TcpStream, target_stream: TcpStream) {
+    let (mut cr, mut cw) = client_stream.into_split();
+    let (mut tr, mut tw) = target_stream.into_split();
+
+    let client_to_target = async {
+        let _ = tokio::io::copy(&mut cr, &mut tw).await;
+        let _ = tw.shutdown().await;
+    };
+
+    let target_to_client = async {
+        let _ = tokio::io::copy(&mut tr, &mut cw).await;
+        let _ = cw.shutdown().await;
+    };
+
+    tokio::join!(client_to_target, target_to_client);
+}
 
 pub struct ProxyServer {
     state: Arc<AppState>,
@@ -105,36 +141,58 @@ async fn connect_with_doh(
     let ja3_shuffle = state.ja3_shuffle.load(Ordering::Relaxed);
     let block_trackers = state.dns_enabled.load(Ordering::Relaxed);
 
-    // 1. Attempt Encrypted ODoH Relay / DoH Resolution with Real-Time CNAME Uncloaking
+    // 1. Encrypted ODoH Relay / DoH Resolution (A + fallback AAAA) with CNAME Uncloaking
     match doh_pool
-        .resolve_ip_verified(host, use_odoh, ja3_shuffle, block_trackers)
+        .resolve_ips_verified(host, use_odoh, ja3_shuffle, block_trackers)
         .await
     {
-        Ok((ip, used_odoh, route_name)) => {
-            let addr = SocketAddr::new(ip, port);
-            if let Ok(s) = TcpStream::connect(addr).await {
-                if used_odoh {
-                    state.odoh_queries_relayed.fetch_add(1, Ordering::Relaxed);
-                    state
-                        .log_event(
-                            "ODOH_RESOLVED",
-                            "Oblivious DoH (ODoH) Relayed",
-                            &format!("Resolved {} -> {} via {}", host, ip, route_name),
-                            host,
-                        )
-                        .await;
-                } else {
-                    state
-                        .log_event(
-                            "DOH_RESOLVED",
-                            "Encrypted DoH Resolution",
-                            &format!("Blinded ISP: Resolved {} -> {} via {}", host, ip, route_name),
-                            host,
-                        )
-                        .await;
+        Ok((ips, used_odoh, route_name)) => {
+            state
+                .odoh_fallback_active
+                .store(use_odoh && !used_odoh, Ordering::Relaxed);
+
+            let mut last_conn_err: Option<std::io::Error> = None;
+            for ip in ips.into_iter().take(4) {
+                let addr = SocketAddr::new(ip, port);
+                match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
+                    Ok(Ok(s)) => {
+                        if used_odoh {
+                            state.odoh_queries_relayed.fetch_add(1, Ordering::Relaxed);
+                            state
+                                .log_event(
+                                    "ODOH_RESOLVED",
+                                    "Oblivious DoH (ODoH) Relayed",
+                                    &format!("Resolved {} -> {} via {}", host, ip, route_name),
+                                    host,
+                                )
+                                .await;
+                        } else {
+                            state
+                                .log_event(
+                                    "DOH_RESOLVED",
+                                    "Encrypted DoH Resolution",
+                                    &format!(
+                                        "Blinded ISP: Resolved {} -> {} via {}",
+                                        host, ip, route_name
+                                    ),
+                                    host,
+                                )
+                                .await;
+                        }
+                        return Ok(s);
+                    }
+                    Ok(Err(e)) => last_conn_err = Some(e),
+                    Err(_) => {
+                        last_conn_err = Some(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("TCP connect timed out for {}:{}", ip, port),
+                        ));
+                    }
                 }
-                return Ok(s);
             }
+            return Err(last_conn_err.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::HostUnreachable, "No reachable IPs")
+            }));
         }
         Err(crate::dns::doh_pool::ResolveError::CnameCloakedTracker {
             original_domain,
@@ -160,14 +218,33 @@ async fn connect_with_doh(
                 format!("Blocked CNAME cloaked tracker: {}", matched_tracker),
             ));
         }
-        Err(crate::dns::doh_pool::ResolveError::Failed(_)) => {}
+        Err(crate::dns::doh_pool::ResolveError::Failed(reason)) => {
+            // Only fall back to OS resolver for local/intranet names or if all DNS privacy is off
+            let is_local_name = host.eq_ignore_ascii_case("localhost")
+                || host.to_ascii_lowercase().ends_with(".local")
+                || !host.contains('.');
+            if !is_local_name && (use_odoh || block_trackers) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::HostUnreachable,
+                    format!("Encrypted DNS failed (refusing plaintext OS fallback): {}", reason),
+                ));
+            }
+        }
     }
 
-    // 2. Fallback to standard connection if DoH failed or for internal hostnames
-    let target = format!("{}:{}", host, port);
-    TcpStream::connect(&target).await
+    // 2. Local hostname fallback (or when encrypted resolution + blocking are turned off)
+    let target = if host.contains(':') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    };
+    tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&target))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Connect timed out"))?
 }
 
+/// Inspects initial tunnel traffic without deadlocking server-speaks-first protocols (SMTP/SSH/IMAP)
+/// and buffers split TLS ClientHello records cleanly before applying SNI blinding.
 async fn forward_tls_initial_flight(
     client_stream: &mut TcpStream,
     target_stream: &mut TcpStream,
@@ -175,19 +252,54 @@ async fn forward_tls_initial_flight(
     port: u16,
     state: &AppState,
 ) -> std::io::Result<()> {
-    let mut first_packet = [0u8; 4096];
-    let bytes_read = client_stream.read(&mut first_packet).await?;
-    if bytes_read == 0 {
-        return Ok(());
+    let mut client_buf = Vec::with_capacity(8192);
+    let mut c_chunk = [0u8; 4096];
+    let mut s_chunk = [0u8; 4096];
+
+    tokio::select! {
+        res = client_stream.read(&mut c_chunk) => {
+            let n = res?;
+            if n == 0 {
+                return Ok(());
+            }
+            client_buf.extend_from_slice(&c_chunk[..n]);
+        }
+        res = target_stream.read(&mut s_chunk) => {
+            let n = res?;
+            if n == 0 {
+                return Ok(());
+            }
+            // Server-speaks-first protocol (e.g. SMTP banner, SSH greeting): relay immediately and hand off
+            client_stream.write_all(&s_chunk[..n]).await?;
+            client_stream.flush().await?;
+            return Ok(());
+        }
     }
 
     let use_sni_frag = state.sni_fragmentation.load(Ordering::Relaxed);
-    let use_record_split = state.ja3_shuffle.load(Ordering::Relaxed) && port == 443;
 
-    if use_sni_frag || use_record_split {
+    if use_sni_frag && client_buf.len() >= 5 && client_buf[0] == 0x16 {
+        // Buffer remainder of split TLS ClientHello record up to 16 KB (within 60ms)
+        let rec_len = u16::from_be_bytes([client_buf[3], client_buf[4]]) as usize;
+        let expected_total = (5 + rec_len).min(16384);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(60);
+
+        while client_buf.len() < expected_total {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match tokio::time::timeout(deadline - now, client_stream.read(&mut c_chunk)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(more)) => client_buf.extend_from_slice(&c_chunk[..more]),
+                Ok(Err(e)) => return Err(e),
+            }
+        }
+
+        let use_record_split = port == 443;
         let (did_obfuscate, did_record_split) = send_obfuscated_client_hello(
             target_stream,
-            &first_packet[..bytes_read],
+            &client_buf,
             use_record_split,
             use_sni_frag,
         )
@@ -195,31 +307,26 @@ async fn forward_tls_initial_flight(
 
         if did_obfuscate {
             state.sni_sliced_handshakes.fetch_add(1, Ordering::Relaxed);
-            if did_record_split {
-                state.ja3_fingerprints_shuffled.fetch_add(1, Ordering::Relaxed);
-                state
-                    .log_event(
-                        "SNI_FRAGMENTED",
-                        "Anti-DPI & Record Split Applied",
-                        &format!("Multi-record split TLS ClientHello for {} to blind ISP & passive JA3 DPI", host),
-                        host,
-                    )
-                    .await;
-            } else {
-                state
-                    .log_event(
-                        "SNI_FRAGMENTED",
-                        "Anti-DPI: SNI Packet Sliced",
-                        &format!("Fragmented TLS ClientHello for {} to blind ISP inspection", host),
-                        host,
-                    )
-                    .await;
-            }
+            state
+                .log_event(
+                    "SNI_FRAGMENTED",
+                    if did_record_split {
+                        "Anti-DPI: Multi-Record SNI Split"
+                    } else {
+                        "Anti-DPI: SNI TCP Fragmented"
+                    },
+                    &format!(
+                        "Split TLS ClientHello for {} against single-packet DPI",
+                        host
+                    ),
+                    host,
+                )
+                .await;
             return Ok(());
         }
     }
 
-    target_stream.write_all(&first_packet[..bytes_read]).await?;
+    target_stream.write_all(&client_buf).await?;
     target_stream.flush().await?;
     Ok(())
 }
@@ -253,12 +360,7 @@ async fn handle_client(
         }
 
         let target_host_port = parts[1];
-        let host = target_host_port.split(':').next().unwrap_or(target_host_port);
-        let port: u16 = target_host_port
-            .split(':')
-            .nth(1)
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(443);
+        let (host, port) = parse_host_port(target_host_port, 443);
 
         // Tracker & WebRTC STUN/TURN Policy Check
         if check_policy_block(host, port, "HTTP", &state).await {
@@ -277,6 +379,7 @@ async fn handle_client(
                 return Ok(());
             }
             Err(e) => {
+                eprintln!("[PROXY] HTTP CONNECT {}:{} -> 502 ({})", host, port, e);
                 client_stream
                     .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
                     .await?;
@@ -301,36 +404,19 @@ async fn handle_client(
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
 
-        // Forward initial TLS flight with SNI/Record obfuscation
+        // Forward initial TLS flight with SNI/Record obfuscation (or server-speaks-first banner)
         forward_tls_initial_flight(&mut client_stream, &mut target_stream, host, port, &state)
             .await?;
 
         // Stream remaining bidirectional TCP traffic
-        let (mut cr, mut cw) = client_stream.into_split();
-        let (mut tr, mut tw) = target_stream.into_split();
-
-        let client_to_target = async {
-            let _ = tokio::io::copy(&mut cr, &mut tw).await;
-            let _ = tw.shutdown().await;
-        };
-
-        let target_to_client = async {
-            let _ = tokio::io::copy(&mut tr, &mut cw).await;
-            let _ = cw.shutdown().await;
-        };
-
-        tokio::join!(client_to_target, target_to_client);
+        relay_bidirectional(client_stream, target_stream).await;
         return Ok(());
     }
 
     // 3. PLAIN HTTP FORWARD PROXY (GET / POST / etc.)
     if let Some(host_line) = request_head.lines().find(|l| l.to_ascii_lowercase().starts_with("host:")) {
         let host = host_line["host:".len()..].trim();
-        let (host_str, port) = if let Some((h, p)) = host.split_once(':') {
-            (h, p.parse::<u16>().unwrap_or(80))
-        } else {
-            (host, 80)
-        };
+        let (host_str, port) = parse_host_port(host, 80);
 
         if check_policy_block(host_str, port, "HTTP", &state).await {
             client_stream
@@ -352,18 +438,16 @@ async fn handle_client(
                     )
                     .await;
 
-                let payload_to_send = if state.ja3_shuffle.load(Ordering::Relaxed) {
-                    if let Some(norm) = normalize_http_request_headers(&initial_buf[..n]) {
-                        state.ja3_fingerprints_shuffled.fetch_add(1, Ordering::Relaxed);
-                        norm
-                    } else {
-                        initial_buf[..n].to_vec()
-                    }
-                } else {
-                    initial_buf[..n].to_vec()
-                };
+                let normalize_identity = state.ja3_shuffle.load(Ordering::Relaxed);
+                let payload_to_send = rewrite_http_proxy_head(&initial_buf[..n], normalize_identity)
+                    .unwrap_or_else(|| initial_buf[..n].to_vec());
+                if normalize_identity {
+                    state.ja3_fingerprints_shuffled.fetch_add(1, Ordering::Relaxed);
+                }
 
                 target_stream.write_all(&payload_to_send).await?;
+                target_stream.flush().await?;
+
                 let (mut cr, mut cw) = client_stream.into_split();
                 let (mut tr, mut tw) = target_stream.into_split();
 
@@ -377,7 +461,15 @@ async fn handle_client(
                     let _ = cw.shutdown().await;
                 };
 
-                tokio::join!(client_to_target, target_to_client);
+                // Enforce single-request policy boundary: end tunnel as soon as origin finishes its response
+                tokio::pin!(target_to_client);
+                tokio::pin!(client_to_target);
+                tokio::select! {
+                    _ = &mut target_to_client => {}
+                    _ = &mut client_to_target => {
+                        let _ = target_to_client.await;
+                    }
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 client_stream
@@ -486,6 +578,7 @@ async fn handle_socks5(
             return Ok(());
         }
         Err(e) => {
+            eprintln!("[PROXY] SOCKS5 {}:{} -> 0x04 ({})", target_host, target_port, e);
             // Host unreachable (0x04)
             let _ = client_stream.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
             return Err(Box::new(e));
@@ -518,19 +611,19 @@ async fn handle_socks5(
     .await?;
 
     // Bidirectional TCP forwarding
-    let (mut cr, mut cw) = client_stream.into_split();
-    let (mut tr, mut tw) = target_stream.into_split();
-
-    let client_to_target = async {
-        let _ = tokio::io::copy(&mut cr, &mut tw).await;
-        let _ = tw.shutdown().await;
-    };
-
-    let target_to_client = async {
-        let _ = tokio::io::copy(&mut tr, &mut cw).await;
-        let _ = cw.shutdown().await;
-    };
-
-    tokio::join!(client_to_target, target_to_client);
+    relay_bidirectional(client_stream, target_stream).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod proxy_unit_tests {
+    use super::parse_host_port;
+
+    #[test]
+    fn test_parse_host_port_ipv4_ipv6_and_domains() {
+        assert_eq!(parse_host_port("example.com:8443", 443), ("example.com", 8443));
+        assert_eq!(parse_host_port("example.com", 443), ("example.com", 443));
+        assert_eq!(parse_host_port("[::1]:59736", 443), ("::1", 59736));
+        assert_eq!(parse_host_port("[2606:4700:4700::1111]", 443), ("2606:4700:4700::1111", 443));
+    }
 }

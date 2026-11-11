@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 pub struct ManagedTray(pub Mutex<Option<TrayController>>);
 
@@ -80,7 +80,7 @@ async fn get_privacy_status(state: State<'_, Arc<AppState>>) -> Result<AppConfig
 
 #[tauri::command]
 async fn get_privacy_metrics(state: State<'_, Arc<AppState>>) -> Result<PrivacyMetrics, String> {
-    Ok(state.get_metrics())
+    Ok(state.get_metrics().await)
 }
 
 #[tauri::command]
@@ -189,7 +189,10 @@ async fn reassert_system_proxy(state: State<'_, Arc<AppState>>) -> Result<bool, 
 async fn trigger_manual_chaff_burst(
     state: State<'_, Arc<AppState>>,
     decorrelator: State<'_, Arc<DecorrelatorEngine>>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    if !state.chaff_enabled.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
     decorrelator.trigger_chaff_burst("MANUAL", "manual.chaff.trigger");
     state
         .log_event(
@@ -199,12 +202,23 @@ async fn trigger_manual_chaff_burst(
             "manual.chaff.trigger",
         )
         .await;
-    Ok(())
+    Ok(true)
 }
 
 #[tauri::command]
-async fn trigger_panic(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    execute_panic_killswitch(state.inner().clone()).await
+async fn trigger_panic(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    tray: State<'_, Arc<ManagedTray>>,
+) -> Result<String, String> {
+    let msg = execute_panic_killswitch(state.inner().clone()).await?;
+    if let Ok(guard) = tray.0.lock() {
+        if let Some(ref ctrl) = *guard {
+            ctrl.sync_with_state(&state);
+        }
+    }
+    let _ = app.emit("privacy-state-changed", ());
+    Ok(msg)
 }
 
 #[tauri::command]
@@ -378,12 +392,19 @@ pub fn run() {
                     .await;
             });
 
+            async fn graceful_signal_shutdown(app: tauri::AppHandle) {
+                let _ = tokio::task::spawn_blocking(disable_system_proxy).await;
+                app.exit(0);
+                // Ensure prompt termination even if an idle headless/webview loop refuses to pump Exit
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                std::process::exit(0);
+            }
+
             // Register graceful termination cleanup to ensure proxy is reset and process exits cleanly on signals
             let sig_int_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if tokio::signal::ctrl_c().await.is_ok() {
-                    let _ = disable_system_proxy();
-                    sig_int_app.exit(0);
+                    graceful_signal_shutdown(sig_int_app).await;
                 }
             });
 
@@ -394,8 +415,7 @@ pub fn run() {
                     use tokio::signal::unix::{signal, SignalKind};
                     if let Ok(mut term) = signal(SignalKind::terminate()) {
                         term.recv().await;
-                        let _ = disable_system_proxy();
-                        sig_term_app.exit(0);
+                        graceful_signal_shutdown(sig_term_app).await;
                     }
                 });
 
@@ -404,8 +424,7 @@ pub fn run() {
                     use tokio::signal::unix::{signal, SignalKind};
                     if let Ok(mut hup) = signal(SignalKind::hangup()) {
                         hup.recv().await;
-                        let _ = disable_system_proxy();
-                        sig_hup_app.exit(0);
+                        graceful_signal_shutdown(sig_hup_app).await;
                     }
                 });
             }
@@ -416,16 +435,15 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| match event {
             #[cfg(target_os = "macos")]
-            tauri::RunEvent::Reopen {
-                has_visible_windows,
-                ..
-            } => {
-                if !has_visible_windows {
-                    if let Some(window) = app_handle.get_webview_window("main") {
+            tauri::RunEvent::Reopen { .. } => {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    if !window.is_visible().unwrap_or(false)
+                        || window.is_minimized().unwrap_or(false)
+                    {
                         let _ = window.unminimize();
                         let _ = window.show();
-                        let _ = window.set_focus();
                     }
+                    let _ = window.set_focus();
                 }
             }
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {

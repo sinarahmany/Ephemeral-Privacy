@@ -8,7 +8,9 @@ use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, Wry};
 
+#[derive(Clone)]
 pub struct TrayController {
+    app: AppHandle<Wry>,
     chaff: CheckMenuItem<Wry>,
     sni: CheckMenuItem<Wry>,
     odoh: CheckMenuItem<Wry>,
@@ -17,23 +19,36 @@ pub struct TrayController {
 }
 
 impl TrayController {
-    /// Synchronizes menu bar checkmarks with the shared `AppState`.
+    /// Synchronizes menu bar checkmarks and tooltip with the shared `AppState`.
     pub fn sync_with_state(&self, state: &AppState) {
-        let _ = self
-            .chaff
-            .set_checked(state.chaff_enabled.load(Ordering::Relaxed));
-        let _ = self
-            .sni
-            .set_checked(state.sni_fragmentation.load(Ordering::Relaxed));
-        let _ = self
-            .odoh
-            .set_checked(state.odoh_enabled.load(Ordering::Relaxed));
-        let _ = self
-            .webrtc
-            .set_checked(state.webrtc_shield.load(Ordering::Relaxed));
-        let _ = self
-            .sentinel
-            .set_checked(state.hardware_sentinel_enabled.load(Ordering::Relaxed));
+        let chaff_on = state.chaff_enabled.load(Ordering::Relaxed);
+        let sni_on = state.sni_fragmentation.load(Ordering::Relaxed);
+        let odoh_on = state.odoh_enabled.load(Ordering::Relaxed);
+        let webrtc_on = state.webrtc_shield.load(Ordering::Relaxed);
+        let sentinel_on = state.hardware_sentinel_enabled.load(Ordering::Relaxed);
+        let proxy_on = state.proxy_enabled.load(Ordering::Relaxed);
+        let dns_on = state.dns_enabled.load(Ordering::Relaxed);
+        let odoh_fallback = state.odoh_fallback_active.load(Ordering::Relaxed);
+
+        let _ = self.chaff.set_checked(chaff_on);
+        let _ = self.sni.set_checked(sni_on);
+        let _ = self.odoh.set_checked(odoh_on);
+        let _ = self.webrtc.set_checked(webrtc_on);
+        let _ = self.sentinel.set_checked(sentinel_on);
+
+        let tooltip = if !proxy_on {
+            "Ephemeral Privacy Suite — Direct Mode (OS Proxy OFF)"
+        } else if odoh_on && odoh_fallback {
+            "Ephemeral Privacy Suite — Shield Active (ODoH Relay Fallback -> DoH)"
+        } else if !sni_on || !dns_on {
+            "Ephemeral Privacy Suite — Shield Partial (Some Protections OFF)"
+        } else {
+            "Ephemeral Privacy Suite — Shield Active"
+        };
+
+        if let Some(tray) = self.app.tray_by_id("ephemeral-tray") {
+            let _ = tray.set_tooltip(Some(tooltip));
+        }
     }
 }
 
@@ -125,6 +140,7 @@ pub fn setup_tray(
     )?;
 
     let controller = TrayController {
+        app: app.clone(),
         chaff: chaff.clone(),
         sni: sni.clone(),
         odoh: odoh.clone(),
@@ -144,11 +160,7 @@ pub fn setup_tray(
 
     let state_for_menu = state.clone();
     let deco_for_menu = decorrelator.clone();
-    let chaff_item = chaff;
-    let sni_item = sni;
-    let odoh_item = odoh;
-    let webrtc_item = webrtc;
-    let sentinel_item = sentinel;
+    let ctrl_for_menu = controller.clone();
 
     builder
         .on_tray_icon_event(|tray, event| {
@@ -170,6 +182,7 @@ pub fn setup_tray(
         .on_menu_event(move |app, event| {
             let state = state_for_menu.clone();
             let deco = deco_for_menu.clone();
+            let ctrl = ctrl_for_menu.clone();
             match event.id.as_ref() {
                 "open_dashboard" => {
                     show_main_window(app);
@@ -177,59 +190,79 @@ pub fn setup_tray(
                 "toggle_chaff" => {
                     let next = !state.chaff_enabled.load(Ordering::Relaxed);
                     state.chaff_enabled.store(next, Ordering::Relaxed);
-                    let _ = chaff_item.set_checked(next);
+                    ctrl.sync_with_state(&state);
                     let _ = app.emit("privacy-state-changed", ());
                 }
                 "toggle_sni" => {
                     let next = !state.sni_fragmentation.load(Ordering::Relaxed);
                     state.sni_fragmentation.store(next, Ordering::Relaxed);
-                    let _ = sni_item.set_checked(next);
+                    ctrl.sync_with_state(&state);
                     let _ = app.emit("privacy-state-changed", ());
                 }
                 "toggle_odoh" => {
                     let next = !state.odoh_enabled.load(Ordering::Relaxed);
                     state.odoh_enabled.store(next, Ordering::Relaxed);
-                    let _ = odoh_item.set_checked(next);
+                    ctrl.sync_with_state(&state);
                     let _ = app.emit("privacy-state-changed", ());
                 }
                 "toggle_webrtc" => {
                     let next = !state.webrtc_shield.load(Ordering::Relaxed);
                     state.webrtc_shield.store(next, Ordering::Relaxed);
-                    let _ = webrtc_item.set_checked(next);
+                    ctrl.sync_with_state(&state);
                     let _ = app.emit("privacy-state-changed", ());
                 }
                 "toggle_sentinel" => {
                     let next = !state.hardware_sentinel_enabled.load(Ordering::Relaxed);
                     state.hardware_sentinel_enabled.store(next, Ordering::Relaxed);
-                    let _ = sentinel_item.set_checked(next);
+                    ctrl.sync_with_state(&state);
                     let _ = app.emit("privacy-state-changed", ());
                 }
                 "decoy_burst" => {
-                    deco.trigger_chaff_burst("TRAY_MANUAL", "tray.decoy.trigger");
-                    let s = state.clone();
-                    tauri::async_runtime::spawn(async move {
-                        s.log_event(
-                            "DNS_CHAFF",
-                            "Tray Decoy Burst Dispatched",
-                            "Triggered manually from Menu Bar companion.",
-                            "tray.decoy.trigger",
-                        )
-                        .await;
-                    });
+                    if state.chaff_enabled.load(Ordering::Relaxed) {
+                        deco.trigger_chaff_burst("TRAY_MANUAL", "tray.decoy.trigger");
+                        let s = state.clone();
+                        tauri::async_runtime::spawn(async move {
+                            s.log_event(
+                                "DNS_CHAFF",
+                                "Tray Decoy Burst Dispatched",
+                                "Triggered manually from Menu Bar companion.",
+                                "tray.decoy.trigger",
+                            )
+                            .await;
+                        });
+                    } else {
+                        let s = state.clone();
+                        tauri::async_runtime::spawn(async move {
+                            s.log_event(
+                                "CHAFF_SKIPPED",
+                                "Tray Decoy Burst Skipped (Chaff OFF)",
+                                "Enable Decoy Traffic Camouflage before sending manual decoys.",
+                                "localhost",
+                            )
+                            .await;
+                        });
+                    }
                     let _ = app.emit("privacy-state-changed", ());
                 }
                 "panic_reset" => {
                     let s = state.clone();
                     let app_handle = app.clone();
+                    let ctrl_sync = ctrl.clone();
                     tauri::async_runtime::spawn(async move {
-                        let _ = execute_panic_killswitch(s).await;
+                        let _ = execute_panic_killswitch(s.clone()).await;
+                        ctrl_sync.sync_with_state(&s);
                         let _ = app_handle.emit("privacy-state-changed", ());
                     });
                 }
                 "quit_app" => {
                     println!("[SHUTDOWN] Tray quit requested, restoring direct OS network...");
-                    let _ = disable_system_proxy();
-                    app.exit(0);
+                    let app_handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = tokio::task::spawn_blocking(disable_system_proxy).await;
+                        app_handle.exit(0);
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        std::process::exit(0);
+                    });
                 }
                 _ => {}
             }
