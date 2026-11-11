@@ -6,7 +6,7 @@ pub mod sinkhole;
 use crate::decorrelator::DecorrelatorEngine;
 use crate::dns::cname::{build_sinkhole_response, inspect_cname_response};
 use crate::dns::doh_pool::DohPool;
-use crate::dns::sinkhole::is_tracker;
+use crate::dns::sinkhole::match_tracker;
 use crate::proxy::webrtc_shield::is_webrtc_stun_target;
 use crate::state::AppState;
 use simple_dns::Packet;
@@ -127,7 +127,7 @@ async fn handle_dns_query(
     }
 
     // 2. Direct Sinkhole Tracker Check
-    if let Some(tracker_name) = is_tracker(clean_domain) {
+    if let Some(tracker_name) = match_tracker(clean_domain) {
         state.trackers_blocked.fetch_add(1, Ordering::Relaxed);
         state
             .log_event(

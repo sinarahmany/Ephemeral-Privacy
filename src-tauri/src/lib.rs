@@ -362,6 +362,9 @@ pub fn run() {
             // Start Hardware Snooping Sentinel (Camera & Microphone watchdog)
             start_hardware_sentinel(app_state.clone());
 
+            // Sync community ad/tracker blocklists strictly into volatile RAM
+            crate::dns::sinkhole::spawn_blocklist_sync(app_state.clone());
+
             // Log startup
             let state_clone = app_state.clone();
             tauri::async_runtime::spawn(async move {

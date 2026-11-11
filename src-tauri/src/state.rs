@@ -38,6 +38,7 @@ pub struct PrivacyMetrics {
     pub webrtc_leaks_blocked: u64,
     pub ja3_fingerprints_shuffled: u64,
     pub hardware_alerts_count: u64,
+    pub blocklist_rules: u64,
 }
 
 pub struct AppState {
@@ -71,6 +72,7 @@ pub struct AppState {
     pub webrtc_leaks_blocked: AtomicU64,
     pub ja3_fingerprints_shuffled: AtomicU64,
     pub hardware_alerts_count: AtomicU64,
+    pub blocklist_rules: AtomicU64,
 
     // Event counter & Circular Log Buffer (max 50 items, strictly RAM)
     pub event_sequence: AtomicU64,
@@ -108,6 +110,7 @@ impl AppState {
             webrtc_leaks_blocked: AtomicU64::new(0),
             ja3_fingerprints_shuffled: AtomicU64::new(0),
             hardware_alerts_count: AtomicU64::new(0),
+            blocklist_rules: AtomicU64::new(crate::dns::sinkhole::total_blocklist_rules() as u64),
 
             event_sequence: AtomicU64::new(0),
             recent_events: Arc::new(RwLock::new(VecDeque::with_capacity(60))),
@@ -148,6 +151,7 @@ impl AppState {
             webrtc_leaks_blocked: self.webrtc_leaks_blocked.load(Ordering::Relaxed),
             ja3_fingerprints_shuffled: self.ja3_fingerprints_shuffled.load(Ordering::Relaxed),
             hardware_alerts_count: self.hardware_alerts_count.load(Ordering::Relaxed),
+            blocklist_rules: self.blocklist_rules.load(Ordering::Relaxed),
         }
     }
 }

@@ -341,30 +341,45 @@ pub async fn run_full_privacy_audit(
     // 5. Ad & Telemetry Tracker Sinkhole Check (Live Proxy Probe)
     {
         let start = Instant::now();
+        let dns_blocking_on = state.dns_enabled.load(Ordering::Relaxed);
+        let active_rules = crate::dns::sinkhole::total_blocklist_rules();
         let rule_hit = is_tracker("doubleclick.net");
         let proxy_reply = probe_local_proxy_connect("doubleclick.net", 443).await;
 
         let (status, pts, summary, proof) = match proxy_reply {
+            Ok(ref line) if !dns_blocking_on => (
+                "WARN",
+                5,
+                format!(
+                    "Ad & Tracker blocking is currently switched OFF ({} RAM filter rules standing by).",
+                    active_rules
+                ),
+                format!("Live CONNECT doubleclick.net:443 -> '{}' while dns_enabled=false.", line),
+            ),
             Ok(ref line) if line.contains("403") && rule_hit.is_some() => (
                 "PASS",
                 15,
-                "Known ad & telemetry domains are sinkholed locally before any connection opens.",
                 format!(
-                    "Live CONNECT doubleclick.net:443 -> '{}' (matched category: {}).",
+                    "Blocking ads & telemetry across {} RAM filter rules + real-time CNAME uncloaking.",
+                    active_rules
+                ),
+                format!(
+                    "Live CONNECT doubleclick.net:443 -> '{}' (matched rule: {}; {} volatile RAM rules loaded).",
                     line,
-                    rule_hit.unwrap_or("Tracker")
+                    rule_hit.unwrap_or("Tracker"),
+                    active_rules
                 ),
             ),
             Ok(ref line) => (
                 "WARN",
                 5,
-                "Tracker classification matched, but local proxy returned an unexpected status.",
+                "Tracker classification matched, but local proxy returned an unexpected status.".into(),
                 format!("CONNECT doubleclick.net:443 -> '{}'", line),
             ),
             Err(e) => (
                 "FAIL",
                 0,
-                "Could not verify tracker sinkhole over 127.0.0.1:1080.",
+                "Could not verify tracker sinkhole over 127.0.0.1:1080.".into(),
                 e,
             ),
         };
@@ -376,7 +391,7 @@ pub async fn run_full_privacy_audit(
             points_earned: pts,
             max_points: 15,
             latency_ms: start.elapsed().as_millis() as u64,
-            summary: summary.into(),
+            summary,
             proof,
         });
     }

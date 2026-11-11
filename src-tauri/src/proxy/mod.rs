@@ -5,7 +5,7 @@ pub mod webrtc_shield;
 
 use crate::decorrelator::DecorrelatorEngine;
 use crate::dns::doh_pool::DohPool;
-use crate::dns::sinkhole::is_tracker;
+use crate::dns::sinkhole::match_tracker;
 use crate::proxy::dpi_bypass::send_obfuscated_client_hello;
 use crate::proxy::fingerprint::normalize_http_request_headers;
 use crate::proxy::webrtc_shield::is_webrtc_stun_target;
@@ -77,17 +77,19 @@ async fn check_policy_block(host: &str, port: u16, proto: &str, state: &AppState
         }
     }
 
-    if let Some(tracker) = is_tracker(host) {
-        state.trackers_blocked.fetch_add(1, Ordering::Relaxed);
-        state
-            .log_event(
-                "TRACKER_BLOCKED",
-                &format!("{} Blocked Tracker: {}", proto, tracker),
-                &format!("Denied connection to {}:{}", host, port),
-                host,
-            )
-            .await;
-        return true;
+    if state.dns_enabled.load(Ordering::Relaxed) {
+        if let Some(tracker) = match_tracker(host) {
+            state.trackers_blocked.fetch_add(1, Ordering::Relaxed);
+            state
+                .log_event(
+                    "TRACKER_BLOCKED",
+                    &format!("{} Blocked Tracker: {}", proto, tracker),
+                    &format!("Denied connection to {}:{}", host, port),
+                    host,
+                )
+                .await;
+            return true;
+        }
     }
 
     false
@@ -101,33 +103,64 @@ async fn connect_with_doh(
 ) -> Result<TcpStream, std::io::Error> {
     let use_odoh = state.odoh_enabled.load(Ordering::Relaxed);
     let ja3_shuffle = state.ja3_shuffle.load(Ordering::Relaxed);
+    let block_trackers = state.dns_enabled.load(Ordering::Relaxed);
 
-    // 1. Attempt Encrypted ODoH Relay / DoH Resolution to blind ISP from plaintext DNS
-    if let Ok((ip, used_odoh, route_name)) = doh_pool.resolve_ip_smart(host, use_odoh, ja3_shuffle).await {
-        let addr = SocketAddr::new(ip, port);
-        if let Ok(s) = TcpStream::connect(addr).await {
-            if used_odoh {
-                state.odoh_queries_relayed.fetch_add(1, Ordering::Relaxed);
-                state
-                    .log_event(
-                        "ODOH_RESOLVED",
-                        "Oblivious DoH (ODoH) Relayed",
-                        &format!("Resolved {} -> {} via {}", host, ip, route_name),
-                        host,
-                    )
-                    .await;
-            } else {
-                state
-                    .log_event(
-                        "DOH_RESOLVED",
-                        "Encrypted DoH Resolution",
-                        &format!("Blinded ISP: Resolved {} -> {} via {}", host, ip, route_name),
-                        host,
-                    )
-                    .await;
+    // 1. Attempt Encrypted ODoH Relay / DoH Resolution with Real-Time CNAME Uncloaking
+    match doh_pool
+        .resolve_ip_verified(host, use_odoh, ja3_shuffle, block_trackers)
+        .await
+    {
+        Ok((ip, used_odoh, route_name)) => {
+            let addr = SocketAddr::new(ip, port);
+            if let Ok(s) = TcpStream::connect(addr).await {
+                if used_odoh {
+                    state.odoh_queries_relayed.fetch_add(1, Ordering::Relaxed);
+                    state
+                        .log_event(
+                            "ODOH_RESOLVED",
+                            "Oblivious DoH (ODoH) Relayed",
+                            &format!("Resolved {} -> {} via {}", host, ip, route_name),
+                            host,
+                        )
+                        .await;
+                } else {
+                    state
+                        .log_event(
+                            "DOH_RESOLVED",
+                            "Encrypted DoH Resolution",
+                            &format!("Blinded ISP: Resolved {} -> {} via {}", host, ip, route_name),
+                            host,
+                        )
+                        .await;
+                }
+                return Ok(s);
             }
-            return Ok(s);
         }
+        Err(crate::dns::doh_pool::ResolveError::CnameCloakedTracker {
+            original_domain,
+            canonical_target,
+            matched_tracker,
+        }) => {
+            state.trackers_blocked.fetch_add(1, Ordering::Relaxed);
+            state
+                .log_event(
+                    "TRACKER_BLOCKED",
+                    "Blocked Cloaked CNAME Tracker",
+                    &format!(
+                        "Unmasked '{}' -> '{}' (rule: {}) before TCP connect",
+                        original_domain,
+                        canonical_target.as_deref().unwrap_or(""),
+                        matched_tracker
+                    ),
+                    &original_domain,
+                )
+                .await;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("Blocked CNAME cloaked tracker: {}", matched_tracker),
+            ));
+        }
+        Err(crate::dns::doh_pool::ResolveError::Failed(_)) => {}
     }
 
     // 2. Fallback to standard connection if DoH failed or for internal hostnames
@@ -235,6 +268,22 @@ async fn handle_client(
             return Ok(());
         }
 
+        let mut target_stream = match connect_with_doh(host, port, &doh_pool, &state).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                client_stream
+                    .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                    .await?;
+                return Ok(());
+            }
+            Err(e) => {
+                client_stream
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                    .await?;
+                return Err(Box::new(e));
+            }
+        };
+
         // Legitimate Connection: Increment metric & Trigger Chaff Decoys!
         state.queries_intercepted.fetch_add(1, Ordering::Relaxed);
         decorrelator.trigger_chaff_burst("PROXY_HTTP_CONNECT", host);
@@ -246,16 +295,6 @@ async fn handle_client(
                 host,
             )
             .await;
-
-        let mut target_stream = match connect_with_doh(host, port, &doh_pool, &state).await {
-            Ok(s) => s,
-            Err(e) => {
-                client_stream
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                    .await?;
-                return Err(Box::new(e));
-            }
-        };
 
         // Notify client tunnel established
         client_stream
@@ -300,44 +339,56 @@ async fn handle_client(
             return Ok(());
         }
 
-        state.queries_intercepted.fetch_add(1, Ordering::Relaxed);
-        decorrelator.trigger_chaff_burst("PROXY_HTTP", host_str);
-        state
-            .log_event(
-                "PROXY_INTERCEPTED",
-                "HTTP Request Intercepted",
-                &format!("Forwarded HTTP request for {}", host_str),
-                host_str,
-            )
-            .await;
+        match connect_with_doh(host_str, port, &doh_pool, &state).await {
+            Ok(mut target_stream) => {
+                state.queries_intercepted.fetch_add(1, Ordering::Relaxed);
+                decorrelator.trigger_chaff_burst("PROXY_HTTP", host_str);
+                state
+                    .log_event(
+                        "PROXY_INTERCEPTED",
+                        "HTTP Request Intercepted",
+                        &format!("Forwarded HTTP request for {}", host_str),
+                        host_str,
+                    )
+                    .await;
 
-        if let Ok(mut target_stream) = connect_with_doh(host_str, port, &doh_pool, &state).await {
-            let payload_to_send = if state.ja3_shuffle.load(Ordering::Relaxed) {
-                if let Some(norm) = normalize_http_request_headers(&initial_buf[..n]) {
-                    state.ja3_fingerprints_shuffled.fetch_add(1, Ordering::Relaxed);
-                    norm
+                let payload_to_send = if state.ja3_shuffle.load(Ordering::Relaxed) {
+                    if let Some(norm) = normalize_http_request_headers(&initial_buf[..n]) {
+                        state.ja3_fingerprints_shuffled.fetch_add(1, Ordering::Relaxed);
+                        norm
+                    } else {
+                        initial_buf[..n].to_vec()
+                    }
                 } else {
                     initial_buf[..n].to_vec()
-                }
-            } else {
-                initial_buf[..n].to_vec()
-            };
+                };
 
-            target_stream.write_all(&payload_to_send).await?;
-            let (mut cr, mut cw) = client_stream.into_split();
-            let (mut tr, mut tw) = target_stream.into_split();
+                target_stream.write_all(&payload_to_send).await?;
+                let (mut cr, mut cw) = client_stream.into_split();
+                let (mut tr, mut tw) = target_stream.into_split();
 
-            let client_to_target = async {
-                let _ = tokio::io::copy(&mut cr, &mut tw).await;
-                let _ = tw.shutdown().await;
-            };
+                let client_to_target = async {
+                    let _ = tokio::io::copy(&mut cr, &mut tw).await;
+                    let _ = tw.shutdown().await;
+                };
 
-            let target_to_client = async {
-                let _ = tokio::io::copy(&mut tr, &mut cw).await;
-                let _ = cw.shutdown().await;
-            };
+                let target_to_client = async {
+                    let _ = tokio::io::copy(&mut tr, &mut cw).await;
+                    let _ = cw.shutdown().await;
+                };
 
-            tokio::join!(client_to_target, target_to_client);
+                tokio::join!(client_to_target, target_to_client);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                client_stream
+                    .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                    .await?;
+            }
+            Err(_) => {
+                client_stream
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                    .await?;
+            }
         }
     }
 
@@ -426,9 +477,14 @@ async fn handle_socks5(
         return Ok(());
     }
 
-    // Connect to destination via encrypted DoH
+    // Connect to destination via encrypted DoH (with real-time CNAME tracker enforcement)
     let mut target_stream = match connect_with_doh(&target_host, target_port, &doh_pool, &state).await {
         Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Reply Connection not allowed by ruleset (0x02)
+            let _ = client_stream.write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+            return Ok(());
+        }
         Err(e) => {
             // Host unreachable (0x04)
             let _ = client_stream.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;

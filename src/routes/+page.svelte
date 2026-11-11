@@ -62,6 +62,7 @@
     webrtc_leaks_blocked: 0,
     ja3_fingerprints_shuffled: 0,
     hardware_alerts_count: 0,
+    blocklist_rules: 0,
     camera_active: false,
     mic_active: false,
     camera_apps: [] as string[],
@@ -791,7 +792,9 @@
                   key: "dns",
                   on: status.dns_enabled,
                   title: "Block Ads, Trackers & Disguised Analytics",
-                  tag: "Sinkhole + CNAME",
+                  tag: metrics.blocklist_rules > 0
+                    ? `${metrics.blocklist_rules.toLocaleString()} RAM Rules`
+                    : "Sinkhole + CNAME",
                   desc: "Drops connections to known ad brokers, spyware servers, and CNAME-cloaked trackers before they load."
                 },
                 {

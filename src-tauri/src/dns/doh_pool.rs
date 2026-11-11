@@ -39,6 +39,35 @@ pub static RESOLVERS: &[UpstreamResolver] = &[
     },
 ];
 
+#[derive(Debug, Clone)]
+pub enum ResolveError {
+    CnameCloakedTracker {
+        original_domain: String,
+        canonical_target: Option<String>,
+        matched_tracker: String,
+    },
+    Failed(String),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::CnameCloakedTracker {
+                original_domain,
+                canonical_target,
+                matched_tracker,
+            } => write!(
+                f,
+                "CNAME cloaked tracker '{}' -> '{}' ({})",
+                original_domain,
+                canonical_target.as_deref().unwrap_or("unknown"),
+                matched_tracker
+            ),
+            ResolveError::Failed(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DohPool {
     client: Client,
@@ -155,19 +184,20 @@ impl DohPool {
     }
 
     /// Performs encrypted DNS resolution (ODoH Relay when enabled, rotated DoH fallback)
-    /// returning `(IpAddr, used_odoh, route_or_resolver_name)`.
-    pub async fn resolve_ip_smart(
+    /// while optionally enforcing real-time CNAME cloaked tracker inspection.
+    pub async fn resolve_ip_verified(
         &self,
         domain: &str,
         use_odoh: bool,
         ja3_shuffle: bool,
-    ) -> Result<(IpAddr, bool, &'static str), String> {
+        block_trackers: bool,
+    ) -> Result<(IpAddr, bool, &'static str), ResolveError> {
         let clean = domain.trim_end_matches('.');
         if let Ok(ip) = clean.parse::<IpAddr>() {
             return Ok((ip, false, "Direct IP"));
         }
 
-        let name = Name::new(clean).map_err(|e| e.to_string())?;
+        let name = Name::new(clean).map_err(|e| ResolveError::Failed(e.to_string()))?;
         let mut query = Packet::new_query(rand::random());
         query.questions.push(Question::new(
             name,
@@ -175,11 +205,38 @@ impl DohPool {
             QCLASS::CLASS(CLASS::IN),
             false,
         ));
-        let raw_packet = query.build_bytes_vec_compressed().map_err(|e| e.to_string())?;
+        let raw_packet = query
+            .build_bytes_vec_compressed()
+            .map_err(|e| ResolveError::Failed(e.to_string()))?;
 
-        let (resp_bytes, used_odoh, route_name) =
-            self.query_dns_smart(&raw_packet, use_odoh, ja3_shuffle).await?;
-        let parsed = Packet::parse(&resp_bytes).map_err(|e| e.to_string())?;
+        let (resp_bytes, used_odoh, route_name) = self
+            .query_dns_smart(&raw_packet, use_odoh, ja3_shuffle)
+            .await
+            .map_err(ResolveError::Failed)?;
+
+        if block_trackers {
+            if let Some(cname_res) = crate::dns::cname::inspect_cname_response(&resp_bytes) {
+                if cname_res.is_cloaked_tracker {
+                    let rule = cname_res
+                        .canonical_target
+                        .as_deref()
+                        .and_then(crate::dns::sinkhole::match_tracker)
+                        .unwrap_or_else(|| {
+                            cname_res
+                                .matched_tracker
+                                .unwrap_or("cname-tracker")
+                                .to_string()
+                        });
+                    return Err(ResolveError::CnameCloakedTracker {
+                        original_domain: cname_res.original_domain,
+                        canonical_target: cname_res.canonical_target,
+                        matched_tracker: rule,
+                    });
+                }
+            }
+        }
+
+        let parsed = Packet::parse(&resp_bytes).map_err(|e| ResolveError::Failed(e.to_string()))?;
 
         for ans in &parsed.answers {
             match &ans.rdata {
@@ -201,7 +258,20 @@ impl DohPool {
             }
         }
 
-        Err(format!("No IP address found for {}", clean))
+        Err(ResolveError::Failed(format!("No IP address found for {}", clean)))
+    }
+
+    /// Performs encrypted DNS resolution (ODoH Relay when enabled, rotated DoH fallback)
+    /// returning `(IpAddr, used_odoh, route_or_resolver_name)`.
+    pub async fn resolve_ip_smart(
+        &self,
+        domain: &str,
+        use_odoh: bool,
+        ja3_shuffle: bool,
+    ) -> Result<(IpAddr, bool, &'static str), String> {
+        self.resolve_ip_verified(domain, use_odoh, ja3_shuffle, false)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Legacy wrapper resolving via encrypted DoH
